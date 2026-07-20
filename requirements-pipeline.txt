@@ -1,0 +1,15 @@
+# Versions restored from the known-working pipeline environment in
+# `karaoke copy 2`. Keep the inference stack pinned: model output and cache
+# provenance include these versions.
+# The setup script installs the host-specific ONNX Runtime after these common
+# dependencies: CoreML/CPU on macOS, CUDA on NVIDIA hosts, DirectML on Windows,
+# and CPU everywhere else.
+audio-separator==0.44.3
+librosa==0.11.0
+numpy==2.4.6
+pytest==9.1.1
+scipy==1.18.0
+soundfile==0.14.0
+torch==2.13.0
+torchaudio==2.11.0
+torchcrepe==0.0.24
