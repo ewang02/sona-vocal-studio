@@ -223,9 +223,8 @@ a:focus-visible {
   align-items: start;
 }
 
-/* Studio fills the viewport: the layout grows into the space under the top bar
-   and song strip, the chart card stretches, and its pitch lane takes whatever
-   height is left so it reaches the bottom on a tall (1080p) screen. */
+/* Studio uses the space under the top bar and song strip while keeping the
+   contour lane independent from the height of the control rail. */
 .studioShell {
   display: flex;
   flex-direction: column;
@@ -235,7 +234,9 @@ a:focus-visible {
   flex: 1 1 auto;
   min-height: 0;
   margin-top: 14px;
-  align-items: stretch;
+  /* Keep the chart and rail independent: the rail can grow below the chart
+     when a mode has more controls without changing the contour height. */
+  align-items: start;
 }
 
 .studioShell .performanceCard {
@@ -244,15 +245,17 @@ a:focus-visible {
 }
 
 .studioShell .pitchLane {
-  flex: 1 1 auto;
-  height: auto;
-  min-height: 340px;
+  flex: 0 0 auto;
+  height: clamp(350px, 45vw, 510px);
+  min-height: 350px;
 }
 
-/* Spread the compact control cards across the full column so their stack lines
-   up with the taller chart card beside them. */
+/* The rail is allowed to be taller than the chart. Keeping its tracks at their
+   natural height prevents removed cards from turning the remaining cards into
+   widely separated floating widgets. */
 .studioShell .coachRail {
-  align-content: space-between;
+  align-content: start;
+  align-self: start;
 }
 
 .performanceCard,
