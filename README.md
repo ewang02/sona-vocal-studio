@@ -32,42 +32,68 @@ local processing companion will prepare it for the studio.
 
 ## Quick start
 
-### 1. Install the requirements
+### 1. Set up Sona
+
+The setup script checks for everything Sona needs, offers to install whatever is
+missing, then installs the JavaScript and Python dependencies.
+
+On macOS or Linux:
+
+```sh
+./scripts/bootstrap.sh
+```
+
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
+```
+
+Pass `--check` to see what is missing without installing anything, or `--yes`
+to skip the confirmation prompt. Re-running is safe — anything already present
+is skipped. If you already have Node.js, `npm run setup` does the same thing.
+
+Setup creates a local Python environment and downloads about 249 MiB of
+vocal-separation models, verified by size and SHA-256 hash before use. Expect
+it to take several minutes the first time.
+
+### 2. Start Sona
+
+```sh
+npm start
+```
+
+That runs the web interface and the local song-processing companion together,
+and stops both when you press Ctrl-C. Open the URL it prints, choose **Add a
+song**, and select an MP3. The song appears in your library when processing
+finishes.
+
+<details>
+<summary>Running the two parts separately</summary>
+
+`npm start` is a convenience wrapper. You can still run each half in its own
+terminal:
+
+```sh
+npm run dev        # web interface
+npm run pipeline   # local song-processing companion
+```
+
+For the production build, run `npm run build`, then either `npm start -- --prod`
+or `npm run serve` alongside `npm run pipeline`.
+
+</details>
+
+### What Sona needs
+
+The setup script handles the first three. Listed here in case you would rather
+install them yourself:
 
 - [Node.js](https://nodejs.org/) 22.13 or newer
-- Python 3.13
+- Python 3.13 or newer
 - [FFmpeg](https://ffmpeg.org/) and FFprobe available on `PATH`
 - A current version of Chrome, Edge, Firefox, or Safari
 - A microphone for live feedback and recording
-
-### 2. Set up Sona
-
-```sh
-npm install
-npm run pipeline:setup
-```
-
-The first pipeline setup creates a local Python environment and downloads
-about 249 MiB of vocal-separation model files. Downloads are verified by size
-and SHA-256 hash before use.
-
-### 3. Start both parts of the app
-
-In one terminal, start the web interface:
-
-```sh
-npm run dev
-```
-
-In a second terminal, start the local song-processing companion:
-
-```sh
-npm run pipeline
-```
-
-Open the URL shown by the development server. Choose **Add a song**, select an
-MP3, and keep the processing companion running while Sona prepares it. The song
-will appear in your library when processing finishes.
 
 ## Using the studio
 
@@ -148,8 +174,10 @@ automatically; other origins are denied by default.
 
 **The Add a song window says the processing companion is unavailable.**
 
-Run `npm run pipeline` in a second terminal and leave it open while adding the
-song. If this is your first run, complete `npm run pipeline:setup` first.
+The companion is not running. Use `npm start`, which runs it alongside the web
+interface — or, if you start the two halves separately, run `npm run pipeline`
+in a second terminal and leave it open while adding the song. If this is your
+first run, complete the setup script first.
 
 **Microphone feedback or recording does not start.**
 
