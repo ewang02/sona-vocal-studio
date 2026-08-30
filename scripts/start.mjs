@@ -12,6 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createServer } from "node:net";
 
 const production = process.argv.slice(2).some((a) => a === "--prod" || a === "--production");
 const webScript = production ? "serve" : "dev";
@@ -20,6 +21,42 @@ const windows = process.platform === "win32";
 const COLORS = { pipeline: "[36m", web: "[35m", dim: "[2m", reset: "[0m" };
 const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
 const paint = (color, text) => (useColor ? `${COLORS[color]}${text}${COLORS.reset}` : text);
+
+const WEB_PORT = 3000;
+const PIPELINE_PORT = Number(process.env.PIPELINE_PORT || 4599);
+
+/**
+ * Report a busy port before spawning anything. Both halves bind fixed ports,
+ * so without this the user sees a raw Node/Vite stack trace instead of the
+ * one thing that matters: something is already listening.
+ */
+function portInUse(port, host) {
+  return new Promise((resolve) => {
+    const probe = createServer();
+    probe.once("error", (error) => resolve(error.code === "EADDRINUSE"));
+    probe.once("listening", () => probe.close(() => resolve(false)));
+    probe.listen(port, host);
+  });
+}
+
+async function checkPorts() {
+  // The web server binds loopback via ::1; the companion binds 127.0.0.1.
+  const busy = [];
+  if (await portInUse(WEB_PORT, "::1")) busy.push([WEB_PORT, "web interface"]);
+  if (await portInUse(PIPELINE_PORT, "127.0.0.1")) busy.push([PIPELINE_PORT, "local companion"]);
+  if (!busy.length) return;
+
+  const lines = busy.map(([port, role]) => `  port ${port} (${role})`).join("\n");
+  const ports = busy.map(([port]) => port).join(" ");
+  process.stderr.write(
+    `\nSona cannot start because these ports are already in use:\n${lines}\n\n` +
+    "This usually means another copy of Sona is still running, possibly from a\n" +
+    "terminal that was closed without stopping it. Stop it with:\n\n" +
+    `  lsof -ti tcp:${ports.split(" ").join(" -ti tcp:")} | xargs kill\n\n` +
+    "Then run npm start again.\n\n",
+  );
+  process.exit(1);
+}
 
 const children = new Map();
 let shuttingDown = false;
@@ -139,6 +176,8 @@ process.stdout.write(
   paint("dim", `Starting the ${production ? "production" : "development"} server and local companion.\n`) +
     paint("dim", "Press Ctrl-C to stop both.\n\n"),
 );
+
+await checkPorts();
 
 start("pipeline", "pipeline");
 start("web", webScript);

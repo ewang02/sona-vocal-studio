@@ -528,6 +528,19 @@ const invokedPath = process.argv[1]
   ? pathToFileURL(resolve(process.argv[1])).href
   : "";
 if (invokedPath === import.meta.url) {
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      // Usually a companion from an earlier run that outlived its terminal.
+      console.error(
+        `[sona] port ${PORT} is already in use, so the companion did not start.\n` +
+        "[sona] Another Sona companion is probably still running. Stop it with:\n" +
+        `[sona]   npx kill-port ${PORT}      (or)  lsof -ti tcp:${PORT} | xargs kill\n` +
+        "[sona] Then run npm start again.",
+      );
+      process.exit(1);
+    }
+    throw error;
+  });
   server.listen(PORT, HOST, () => {
     console.log(`[sona] local companion on http://${HOST}:${PORT}`);
     console.log(`[sona] private library: ${library.libraryRoot}`);
