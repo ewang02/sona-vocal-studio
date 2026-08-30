@@ -7,12 +7,12 @@ The commercial-separator bake-off selected a two-model route:
 * ``Kim_Vocal_2.onnx`` supplies the broad vocal pitch anchor.
 * ``5_HP-Karaoke-UVR.pth`` splits that vocal stem into lead/backing evidence.
 
-The resulting app assets are written straight into ``public/``:
+The resulting app assets are written into a caller-selected local library:
 
-    public/audio/<id>.mp3
-    public/audio/<id>-instrumental.mp3
-    public/data/<id>-contour.json
-    public/data/<id>-pyin.json
+    <output>/audio/<id>.mp3
+    <output>/audio/<id>-instrumental.mp3
+    <output>/data/<id>-contour.json
+    <output>/data/<id>-pyin.json
 
 Decoded notes remain an internal source of conservative octave evidence; the
 removed note-bar lane and its public JSON are not regenerated.
@@ -243,6 +243,7 @@ def process(
     anchor_batch_size: int = 512,
     lead_batch_size: int = 64,
     pyin_workers: int = 0,
+    output_dir: Path | None = None,
 ) -> float:
     if branch_workers not in (1, 2):
         raise ValueError("branch_workers must be 1 or 2")
@@ -263,8 +264,9 @@ def process(
     lead_contour = ROOT / "contour_out" / "lead_contours" / f"{song}_contour.csv"
     anchor_csv = ROOT / "contour_out" / f"{song}_contour.csv"
     final_notes = ROOT / "experiments" / "transcription_final" / f"{song}_notes_final.json"
-    public_audio = ROOT / "public" / "audio"
-    public_data = ROOT / "public" / "data"
+    output_root = (output_dir or (ROOT / ".sona-data" / "library")).resolve()
+    public_audio = output_root / "audio"
+    public_data = output_root / "data"
     public_audio.mkdir(parents=True, exist_ok=True)
     public_data.mkdir(parents=True, exist_ok=True)
 
@@ -294,12 +296,9 @@ def process(
     pitch_environment["hardware"] = hardware_environment
     separator_environment["hardware"] = hardware_environment
 
-    # The mix must live at <root>/<song>.mp3 so every downstream stem/id lines up.
-    root_mp3 = ROOT / f"{song}.mp3"
-    if mp3.resolve() != root_mp3.resolve():
-        uploaded_hash = cache.file_hash(mp3)
-        if not root_mp3.exists() or cache.file_hash(root_mp3) != uploaded_hash:
-            atomic_copy(mp3, root_mp3)
+    # Keep the user's source in caller-owned local storage. Downstream stages
+    # use explicit paths and never need a deployable copy in the repository.
+    root_mp3 = mp3.resolve()
     source_hash = cache.file_hash(root_mp3)
 
     # 1. Produce the dependency-critical vocal stem first.  The instrumental
@@ -618,7 +617,7 @@ def process(
     if not final_notes.exists():
         raise RuntimeError(f"transcription not written: {final_notes}")
 
-    # 5. Publish the web-app assets into public/.
+    # 5. Publish the web-app assets into the private local library.
     marker("::step:finalizing")
     notes_evidence = ROOT / "contour_out" / f"{song}_notes_evidence.json"
     note_outputs = [notes_evidence]
@@ -665,7 +664,7 @@ def process(
             ),
         },
         contour_outputs,
-        lambda: run([PYTHON, "work/export_contour.py", ".", "public/data", song]),
+        lambda: run([PYTHON, "work/export_contour.py", ".", str(public_data), song]),
         force=force,
     )
     if not public_contour.exists():
@@ -712,6 +711,11 @@ def main() -> None:
         "--force",
         action="store_true",
         help="rerun every stage even when the integrity-checked cache matches",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="local library root for audio/ and data/ (default: .sona-data/library)",
     )
     parser.add_argument(
         "--branch-workers",
@@ -776,6 +780,7 @@ def main() -> None:
             anchor_batch_size=args.anchor_batch_size,
             lead_batch_size=args.lead_batch_size,
             pyin_workers=args.pyin_workers,
+            output_dir=args.output_dir,
         )
     except Exception as error:  # noqa: BLE001 - surface failures to the server
         marker(f"::error {error}")

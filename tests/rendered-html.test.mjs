@@ -42,7 +42,7 @@ test("renders a content-free song library as the landing view", async () => {
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
-test("ships no songs, contours, or repair sources", async () => {
+test("ships no songs, contours, repair sources, or model weights", async () => {
   const manifest = JSON.parse(await read("public/library.json"));
   assert.deepEqual(manifest.songs, []);
 
@@ -54,6 +54,10 @@ test("ships no songs, contours, or repair sources", async () => {
 
   const songs = await read("app/songs.ts");
   assert.match(songs, /export const SONGS: Song\[\] = \[\]/);
+
+  const publicGuard = await read("scripts/check-public-assets.mjs");
+  assert.match(publicGuard, /\.mp3/);
+  assert.match(publicGuard, /\.onnx/);
 });
 
 test("ships the three-mode editor, practice, and recording behavior", async () => {
@@ -83,6 +87,7 @@ test("ships the three-mode editor, practice, and recording behavior", async () =
   assert.match(studio, /Raw vocals/);
   assert.match(studio, /Instrumental/);
   assert.match(studio, /Combined mix/);
+  assert.equal((studio.match(/crossOrigin="anonymous"/g) ?? []).length, 2);
 
   assert.match(studio, /songTranspose/);
   assert.match(studio, /contourTranspose/);
@@ -105,5 +110,17 @@ test("ships the three-mode editor, practice, and recording behavior", async () =
 
   assert.match(packageJson, /@soundtouchjs\/audio-worklet/);
   assert.match(packageJson, /"pipeline"/);
+  assert.match(packageJson, /"companion"/);
   assert.doesNotMatch(packageJson, /drizzle|react-loading-skeleton/);
+});
+
+test("loads user songs only through the loopback companion", async () => {
+  const library = await read("app/library-data.ts");
+  assert.match(library, /http:\/\/127\.0\.0\.1:4599/);
+  assert.match(library, /`\$\{PIPELINE_BASE\}\/api\/library`/);
+  assert.match(library, /\/api\/songs\/\$\{encodeURIComponent\(card\.id\)\}\/source/);
+  assert.doesNotMatch(library, /fetch\("\/library\.json"/);
+  assert.doesNotMatch(library, /\/api\/pipeline/);
+  assert.doesNotMatch(library, /audio: `\/audio\//);
+  assert.doesNotMatch(library, /repairSource: `\/data\//);
 });

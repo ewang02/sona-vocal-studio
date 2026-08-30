@@ -1,27 +1,19 @@
 /**
  * Library data layer.
  *
- * Built-in songs stay on the static import path (`songs.ts`). Songs created by
- * the local companion pipeline are written to `public/`, listed in
- * `public/library.json`, and loaded from the same origin so WebAudio never sees
- * cross-origin song assets.
+ * Built-in songs stay on the static import path (`songs.ts`). User-provided
+ * songs live behind the loopback-only companion API and never become hosted
+ * build assets.
  */
 
 import { SONGS } from "./songs";
 import type { ContourData, Song } from "./songs";
 
-const DIRECT_PIPELINE_BASE = "http://localhost:4599";
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
-
-/** Use Vite's same-origin proxy in development and loopback elsewhere. */
-export function pipelineBaseForHostname(hostname: string): string {
-  return LOOPBACK_HOSTS.has(hostname) ? "/api/pipeline" : DIRECT_PIPELINE_BASE;
-}
-
-export const PIPELINE_BASE =
-  typeof window === "undefined"
-    ? DIRECT_PIPELINE_BASE
-    : pipelineBaseForHostname(window.location.hostname);
+const DIRECT_PIPELINE_BASE = "http://127.0.0.1:4599";
+// Use the same explicit loopback address everywhere. Besides avoiding
+// localhost IPv4/IPv6 differences, the cross-origin request carries the
+// browser Origin header that the companion verifies before serving local data.
+export const PIPELINE_BASE = DIRECT_PIPELINE_BASE;
 
 /** Lightweight descriptor for a grid card — no heavy contour arrays. */
 export type LibraryCard = {
@@ -50,11 +42,11 @@ export const BUILTIN_CARDS: LibraryCard[] = SONGS.map((song) => ({
   builtin: true,
 }));
 
-/** Built-in cards followed by additional packaged songs from the manifest. */
+/** Built-in cards followed by songs exposed by the private local companion. */
 export async function fetchLibrary(): Promise<LibraryCard[]> {
   let packaged: LibraryCard[] = [];
   try {
-    const response = await fetch("/library.json", { cache: "no-store" });
+    const response = await fetch(`${PIPELINE_BASE}/api/library`, { cache: "no-store" });
     if (response.ok) {
       const data = (await response.json()) as { songs?: ManifestSong[] };
       packaged = (data.songs ?? []).map((song) => ({
@@ -77,7 +69,7 @@ export async function resolveSong(card: LibraryCard): Promise<Song> {
   const builtin = builtinById.get(card.id);
   if (builtin) return builtin;
 
-  const contourResponse = await fetch(`/data/${card.id}-contour.json`, {
+  const contourResponse = await fetch(`${PIPELINE_BASE}/api/songs/${encodeURIComponent(card.id)}/contour`, {
     cache: "no-store",
   });
   if (!contourResponse.ok) throw new Error(`Could not load "${card.title}".`);
@@ -86,9 +78,9 @@ export async function resolveSong(card: LibraryCard): Promise<Song> {
     id: card.id,
     title: card.title,
     artist: card.artist,
-    audio: `/audio/${card.id}.mp3`,
-    instrumental: `/audio/${card.id}-instrumental.mp3`,
-    repairSource: `/data/${card.id}-pyin.json`,
+    audio: `${PIPELINE_BASE}/api/songs/${encodeURIComponent(card.id)}/source`,
+    instrumental: `${PIPELINE_BASE}/api/songs/${encodeURIComponent(card.id)}/instrumental`,
+    repairSource: `${PIPELINE_BASE}/api/songs/${encodeURIComponent(card.id)}/repair`,
     contour,
   };
 }
@@ -152,6 +144,19 @@ export type JobStatus = {
   error: string | null;
 };
 
+export type SetupStatus = {
+  status: "idle" | "running" | "done" | "error";
+  message: string | null;
+  error: string | null;
+};
+
+export type PipelineHealth = {
+  ok: true;
+  ready: boolean;
+  reason: string | null;
+  setup: SetupStatus;
+};
+
 export const STEP_LABELS: Record<string, string> = {
   separating: "Separating vocals",
   isolating: "Isolating lead vocal",
@@ -161,13 +166,32 @@ export const STEP_LABELS: Record<string, string> = {
   done: "Done",
 };
 
-export async function pipelineAvailable(): Promise<boolean> {
+export async function fetchPipelineHealth(): Promise<PipelineHealth | null> {
   try {
     const response = await fetch(`${PIPELINE_BASE}/api/health`, { cache: "no-store" });
-    return response.ok;
+    return response.ok ? response.json() : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export async function pipelineAvailable(): Promise<boolean> {
+  return (await fetchPipelineHealth()) !== null;
+}
+
+export async function startPipelineSetup(): Promise<{ ready: boolean; setup: SetupStatus }> {
+  const response = await fetch(`${PIPELINE_BASE}/api/setup`, {
+    method: "POST",
+    headers: { "X-Sona-Action": "setup" },
+  });
+  if (!response.ok) throw new Error("Local song-processing setup could not start.");
+  return response.json();
+}
+
+export async function fetchPipelineSetup(): Promise<{ ready: boolean; setup: SetupStatus }> {
+  const response = await fetch(`${PIPELINE_BASE}/api/setup`, { cache: "no-store" });
+  if (!response.ok) throw new Error("Lost connection to local song-processing setup.");
+  return response.json();
 }
 
 export async function uploadSong(

@@ -4,35 +4,50 @@
  * The app is served by the Cloudflare Worker runtime (vinext), which cannot
  * spawn Python or run the separator/CREPE toolchain. This tiny Node server runs ALONGSIDE
  * `npm run dev` and does the heavy lifting: it accepts an uploaded mp3, runs
- * the real offline pipeline (work/process_song.py) as a background job, writes
- * the resulting assets into public/, and appends the song to public/library.json
- * so the running dev server serves it with no rebuild.
+ * the real offline pipeline (work/process_song.py) as a background job, and
+ * keeps the user's source audio and generated library in private local storage.
  *
- * Endpoints (CORS-open for localhost):
+ * Endpoints (CORS-limited to the Sona UI):
  *   POST /api/songs?title=…&artist=…   body = raw mp3 bytes  → { jobId, songId }
  *   GET  /api/jobs/:id                  → { status, step, steps, error, songId }
- *   GET  /api/library                   → the manifest (convenience/debug)
- *   GET  /api/health                    → { ok: true }
+ *   GET  /api/library                   → the local manifest
+ *   GET  /api/songs/:id/:kind           → source/instrumental/contour/repair
+ *   POST /api/setup                     → install the optional local ML pipeline
+ *   GET  /api/setup                     → setup status
+ *   GET  /api/health                    → companion + pipeline readiness
  *
- * Run:  npm run pipeline      (defaults to port 4599; override with PORT=…)
+ * Run:  npm run companion     (defaults to port 4599; override with PORT=…)
  */
 
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { applyPipelineCors } from "./pipeline-cors.mjs";
+import { applyPipelineCors, allowedPipelineOrigin } from "./pipeline-cors.mjs";
+import {
+  createLocalLibrary,
+  migrateLegacyLibrary,
+  parseByteRange,
+  SONG_ID_PATTERN,
+} from "./local-library.mjs";
+import { pipelineReadiness } from "../scripts/pipeline-state.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = Number(process.env.PORT || 4599);
+const HOST = "127.0.0.1";
 const MAX_UPLOAD_BYTES = 80 * 1024 * 1024; // generous ceiling for a single song
 const RESERVED_IDS = new Set();
-const MANIFEST_PATH = join(ROOT, "public", "library.json");
-const PUBLIC_DATA = join(ROOT, "public", "data");
-const PUBLIC_AUDIO = join(ROOT, "public", "audio");
+const library = createLocalLibrary(process.env.SONA_DATA_DIR || join(ROOT, ".sona-data"));
 // Ordered pipeline steps the wrapper emits, so the client can show N/total.
 const STEP_ORDER = ["separating", "isolating", "tracking", "transcribing", "finalizing"];
 
@@ -50,25 +65,16 @@ const pythonBin = existsSync(unixVenvPython)
 const jobs = new Map();
 const queue = [];
 let processing = false;
+let readiness = pipelineReadiness();
+const setup = {
+  status: readiness.ready ? "done" : "idle",
+  message: readiness.ready ? "Song processing is ready." : readiness.reason,
+  error: null,
+};
 
 // ---------------------------------------------------------------------------
-// Manifest helpers (server owns public/library.json)
+// Manifest helpers (server owns the private local library)
 // ---------------------------------------------------------------------------
-
-function readManifest() {
-  try {
-    return JSON.parse(readFileSync(MANIFEST_PATH, "utf8"));
-  } catch {
-    return { songs: [] };
-  }
-}
-
-function writeManifest(manifest) {
-  mkdirSync(dirname(MANIFEST_PATH), { recursive: true });
-  const temporary = `${MANIFEST_PATH}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(manifest, null, 2)}\n`);
-  renameSync(temporary, MANIFEST_PATH);
-}
 
 function slugify(title) {
   const base = String(title)
@@ -81,22 +87,10 @@ function slugify(title) {
   return base || "song";
 }
 
-function sha256Bytes(bytes) {
-  return createHash("sha256").update(bytes).digest("hex");
-}
-
-function matchesIncompleteUpload(songId, body) {
-  try {
-    return sha256Bytes(readFileSync(join(ROOT, `${songId}.mp3`))) === sha256Bytes(body);
-  } catch {
-    return false;
-  }
-}
-
-function uniqueId(title, body) {
+function uniqueId(title) {
   const taken = new Set([
     ...RESERVED_IDS,
-    ...readManifest().songs.map((song) => song.id),
+    ...library.readManifest().songs.map((song) => song.id),
     ...[...jobs.values()]
       .filter((job) => job.status === "queued" || job.status === "running")
       .map((job) => job.songId),
@@ -106,21 +100,15 @@ function uniqueId(title, body) {
   let suffix = 2;
   while (true) {
     const hasPartialOutput =
-      existsSync(join(PUBLIC_DATA, `${candidate}-contour.json`)) ||
-      existsSync(join(PUBLIC_AUDIO, `${candidate}.mp3`));
-    if (!taken.has(candidate) && (!hasPartialOutput || matchesIncompleteUpload(candidate, body))) {
+      existsSync(join(library.dataDir, `${candidate}-contour.json`)) ||
+      existsSync(join(library.audioDir, `${candidate}.mp3`));
+    if (!taken.has(candidate) && !hasPartialOutput) {
       return candidate;
     }
     candidate = `${base}-${suffix++}`;
   }
 }
 
-function upsertManifestSong(entry) {
-  const manifest = readManifest();
-  manifest.songs = manifest.songs.filter((song) => song.id !== entry.id);
-  manifest.songs.push(entry);
-  writeManifest(manifest);
-}
 
 // ---------------------------------------------------------------------------
 // Job queue — one song at a time (torchcrepe caches model state; parallel runs
@@ -146,7 +134,14 @@ function pump() {
 function runJob(job) {
   return new Promise((resolvePromise) => {
     job.status = "running";
-    const child = spawn(pythonBin, ["work/process_song.py", job.songId], {
+    const child = spawn(pythonBin, [
+      "work/process_song.py",
+      job.songId,
+      "--mp3",
+      job.uploadPath,
+      "--output-dir",
+      library.libraryRoot,
+    ], {
       cwd: ROOT,
       env: process.env,
     });
@@ -195,14 +190,11 @@ function runJob(job) {
     child.on("close", (code) => {
       if (stdoutBuffer) handleLine(stdoutBuffer);
       if (code === 0 && !job.error) {
-        upsertManifestSong({
+        library.upsertSong({
           id: job.songId,
           title: job.title,
           artist: job.artist,
           duration: job.duration || 0,
-          audio: `/audio/${job.songId}.mp3`,
-          instrumental: `/audio/${job.songId}-instrumental.mp3`,
-          contourUrl: `/data/${job.songId}-contour.json`,
           createdAt: new Date().toISOString(),
         });
         job.status = "done";
@@ -214,8 +206,95 @@ function runJob(job) {
           stderrTail.split("\n").filter(Boolean).pop() ||
           `pipeline exited with code ${code}`;
       }
+      rmSync(job.uploadPath, { force: true });
       resolvePromise();
     });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Optional first-use pipeline setup
+// ---------------------------------------------------------------------------
+
+function setupSnapshot() {
+  return {
+    status: setup.status,
+    message: setup.message,
+    error: setup.error,
+  };
+}
+
+function updateSetupMessage(line) {
+  const text = line.trim();
+  if (!text) return;
+  if (text.startsWith("[pipeline-setup]")) {
+    setup.error = text.slice("[pipeline-setup]".length).trim();
+  } else if (text.includes("downloading") || text.includes("verified")) {
+    setup.message = "Downloading and verifying local model files…";
+  } else if (text.includes("pip") || text.includes("Installing collected packages")) {
+    setup.message = "Installing the local audio-processing tools…";
+  } else if (text.includes("Selected hardware") || text.includes("ONNX providers")) {
+    setup.message = "Checking hardware acceleration…";
+  }
+}
+
+function refreshReadiness() {
+  readiness = pipelineReadiness();
+  if (readiness.ready && setup.status !== "running") {
+    setup.status = "done";
+    setup.message = "Song processing is ready.";
+    setup.error = null;
+  } else if (!readiness.ready && setup.status === "done") {
+    setup.status = "idle";
+    setup.message = readiness.reason;
+    setup.error = null;
+  }
+  return readiness;
+}
+
+function beginSetup() {
+  if (setup.status === "running") return;
+  refreshReadiness();
+  if (readiness.ready) {
+    setup.status = "done";
+    setup.message = "Song processing is ready.";
+    setup.error = null;
+    return;
+  }
+
+  setup.status = "running";
+  setup.message = "Preparing private, on-device song processing…";
+  setup.error = null;
+  const child = spawn(process.execPath, ["scripts/setup-pipeline.mjs"], {
+    cwd: ROOT,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  child.stdout.on("data", (chunk) => {
+    process.stdout.write(chunk);
+    for (const line of chunk.toString().split(/\r?\n/)) updateSetupMessage(line);
+  });
+  child.stderr.on("data", (chunk) => {
+    process.stderr.write(chunk);
+    for (const line of chunk.toString().split(/\r?\n/)) updateSetupMessage(line);
+  });
+  child.on("error", () => {
+    setup.status = "error";
+    setup.message = "Song-processing setup did not start.";
+    setup.error = "Run `npm run setup` in a terminal, then try again.";
+  });
+  child.on("close", (code) => {
+    readiness = pipelineReadiness();
+    if (code === 0 && readiness.ready) {
+      setup.status = "done";
+      setup.message = "Song processing is ready.";
+      setup.error = null;
+    } else {
+      setup.status = "error";
+      setup.message = "Song-processing setup did not finish.";
+      setup.error = setup.error || readiness.reason || "Check the companion terminal for details.";
+    }
   });
 }
 
@@ -225,19 +304,35 @@ function runJob(job) {
 
 function sendJson(request, response, status, body) {
   applyPipelineCors(request, response);
-  response.writeHead(status, { "Content-Type": "application/json" });
+  response.writeHead(status, {
+    "Cache-Control": "no-store",
+    "Content-Type": "application/json; charset=utf-8",
+    "X-Content-Type-Options": "nosniff",
+  });
   response.end(JSON.stringify(body));
+}
+
+function requestOriginAllowed(request) {
+  return allowedPipelineOrigin(request.headers.origin) !== null;
+}
+
+function requireBrowserOrigin(request, response) {
+  if (requestOriginAllowed(request)) return true;
+  sendJson(request, response, 403, { error: "This page is not allowed to use Sona's local companion." });
+  return false;
 }
 
 function readBody(request, limit) {
   return new Promise((resolvePromise, reject) => {
     const chunks = [];
     let size = 0;
+    let rejected = false;
     request.on("data", (chunk) => {
+      if (rejected) return;
       size += chunk.length;
       if (size > limit) {
+        rejected = true;
         reject(new Error("upload too large"));
-        request.destroy();
         return;
       }
       chunks.push(chunk);
@@ -248,9 +343,27 @@ function readBody(request, limit) {
 }
 
 async function handleUpload(request, response, url) {
+  if (!requireBrowserOrigin(request, response)) return;
+  if (request.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !== "application/octet-stream") {
+    return sendJson(request, response, 415, { error: "Upload an MP3 file as application/octet-stream." });
+  }
+  const contentLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(contentLength) && contentLength > MAX_UPLOAD_BYTES) {
+    return sendJson(request, response, 413, { error: "upload too large" });
+  }
+  refreshReadiness();
+  if (!readiness.ready) {
+    return sendJson(request, response, 503, {
+      error: readiness.reason || "Song processing is not ready.",
+      code: "pipeline_not_ready",
+    });
+  }
   const title = (url.searchParams.get("title") || "").trim();
   const artist = (url.searchParams.get("artist") || "").trim();
   if (!title) return sendJson(request, response, 400, { error: "A title is required." });
+  if (title.length > 120 || artist.length > 120) {
+    return sendJson(request, response, 400, { error: "Title and artist must be 120 characters or fewer." });
+  }
 
   let body;
   try {
@@ -262,10 +375,10 @@ async function handleUpload(request, response, url) {
     return sendJson(request, response, 400, { error: "No audio was uploaded." });
   }
 
-  const songId = uniqueId(title, body);
-  mkdirSync(PUBLIC_AUDIO, { recursive: true });
-  mkdirSync(PUBLIC_DATA, { recursive: true });
-  writeFileSync(join(ROOT, `${songId}.mp3`), body);
+  const songId = uniqueId(title);
+  mkdirSync(library.uploadsDir, { recursive: true });
+  const uploadPath = join(library.uploadsDir, `${randomUUID()}.mp3`);
+  writeFileSync(uploadPath, body, { mode: 0o600 });
 
   const job = {
     jobId: randomUUID(),
@@ -280,23 +393,72 @@ async function handleUpload(request, response, url) {
     cache: {},
     timings: {},
     error: null,
+    uploadPath,
   };
   enqueue(job);
   sendJson(request, response, 202, { jobId: job.jobId, songId });
 }
 
+function serveAsset(request, response, asset) {
+  applyPipelineCors(request, response);
+  const size = statSync(asset.path).size;
+  const range = asset.ranged ? parseByteRange(request.headers.range, size) : null;
+  const headers = {
+    "Accept-Ranges": asset.ranged ? "bytes" : "none",
+    "Cache-Control": "private, no-store",
+    "Content-Type": asset.contentType,
+    "X-Content-Type-Options": "nosniff",
+  };
+  if (range === false) {
+    response.writeHead(416, {
+      ...headers,
+      "Content-Length": "0",
+      "Content-Range": `bytes */${size}`,
+    });
+    return response.end();
+  }
+  if (range) {
+    const length = range.end - range.start + 1;
+    response.writeHead(206, {
+      ...headers,
+      "Content-Length": String(length),
+      "Content-Range": `bytes ${range.start}-${range.end}/${size}`,
+    });
+    if (request.method === "HEAD") return response.end();
+    return createReadStream(asset.path, range).pipe(response);
+  }
+  response.writeHead(200, { ...headers, "Content-Length": String(size) });
+  if (request.method === "HEAD") return response.end();
+  createReadStream(asset.path).pipe(response);
+}
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://localhost:${PORT}`);
   if (request.method === "OPTIONS") {
+    if (!requestOriginAllowed(request)) {
+      return sendJson(request, response, 403, { error: "Origin not allowed." });
+    }
     applyPipelineCors(request, response);
     response.writeHead(204);
     return response.end();
   }
 
+  if (request.method === "POST" && url.pathname === "/api/setup") {
+    if (!requireBrowserOrigin(request, response)) return;
+    if (request.headers["x-sona-action"] !== "setup") {
+      return sendJson(request, response, 400, { error: "Missing setup confirmation." });
+    }
+    beginSetup();
+    return sendJson(request, response, setup.status === "done" ? 200 : 202, {
+      ready: readiness.ready,
+      setup: setupSnapshot(),
+    });
+  }
   if (request.method === "POST" && url.pathname === "/api/songs") {
     return handleUpload(request, response, url);
   }
   if (request.method === "GET" && url.pathname.startsWith("/api/jobs/")) {
+    if (!requireBrowserOrigin(request, response)) return;
     const job = jobs.get(url.pathname.slice("/api/jobs/".length));
     if (!job) return sendJson(request, response, 404, { error: "unknown job" });
     const {
@@ -309,16 +471,66 @@ const server = createServer(async (request, response) => {
     });
   }
   if (request.method === "GET" && url.pathname === "/api/library") {
-    return sendJson(request, response, 200, readManifest());
+    if (!requireBrowserOrigin(request, response)) return;
+    const songs = library.readManifest().songs
+      .filter((song) => SONG_ID_PATTERN.test(song?.id || ""))
+      .map(({ id, title, artist, duration, createdAt }) => ({
+        id,
+        title: String(title || "Untitled"),
+        artist: String(artist || ""),
+        duration: Number.isFinite(Number(duration)) ? Number(duration) : 0,
+        ...(createdAt ? { createdAt: String(createdAt) } : {}),
+      }));
+    return sendJson(request, response, 200, { songs });
+  }
+  if (request.method === "GET" && url.pathname === "/api/setup") {
+    if (!requireBrowserOrigin(request, response)) return;
+    refreshReadiness();
+    return sendJson(request, response, 200, {
+      ready: readiness.ready,
+      setup: setupSnapshot(),
+    });
+  }
+  if ((request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/api/songs/")) {
+    if (!requireBrowserOrigin(request, response)) return;
+    const match = /^\/api\/songs\/([^/]+)\/(source|instrumental|contour|repair)$/.exec(url.pathname);
+    let songId = "";
+    try {
+      songId = match ? decodeURIComponent(match[1]) : "";
+    } catch {
+      songId = "";
+    }
+    const asset = SONG_ID_PATTERN.test(songId) && match
+      ? library.resolveAsset(songId, match[2])
+      : null;
+    if (!asset) return sendJson(request, response, 404, { error: "Song asset not found." });
+    return serveAsset(request, response, asset);
   }
   if (request.method === "GET" && url.pathname === "/api/health") {
-    return sendJson(request, response, 200, { ok: true });
+    if (!requireBrowserOrigin(request, response)) return;
+    refreshReadiness();
+    return sendJson(request, response, 200, {
+      ok: true,
+      ready: readiness.ready,
+      reason: readiness.reason,
+      setup: setupSnapshot(),
+    });
   }
   sendJson(request, response, 404, { error: "not found" });
 });
 
-if (!existsSync(MANIFEST_PATH)) writeManifest({ songs: [] });
+const migrated = migrateLegacyLibrary(ROOT, library);
+if (migrated) console.log(`[sona] migrated ${migrated} song(s) into private local storage`);
 
-server.listen(PORT, () => {
-  console.log(`[sona] pipeline server on http://localhost:${PORT}  (python: ${pythonBin})`);
-});
+export { server };
+
+const invokedPath = process.argv[1]
+  ? pathToFileURL(resolve(process.argv[1])).href
+  : "";
+if (invokedPath === import.meta.url) {
+  server.listen(PORT, HOST, () => {
+    console.log(`[sona] local companion on http://${HOST}:${PORT}`);
+    console.log(`[sona] private library: ${library.libraryRoot}`);
+    if (!readiness.ready) console.log(`[sona] ${readiness.reason}`);
+  });
+}

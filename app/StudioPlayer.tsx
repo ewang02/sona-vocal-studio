@@ -1689,8 +1689,19 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
 
   return (
     <main className={`appShell studioShell mode-${studioMode}`}>
-      <audio ref={audioRef} preload="metadata" aria-label={`${song.title} backing track`} />
-      <audio ref={guideAudioRef} src={song.audio} preload="metadata" aria-hidden="true" />
+      <audio
+        ref={audioRef}
+        crossOrigin="anonymous"
+        preload="metadata"
+        aria-label={`${song.title} backing track`}
+      />
+      <audio
+        ref={guideAudioRef}
+        crossOrigin="anonymous"
+        src={song.audio}
+        preload="metadata"
+        aria-hidden="true"
+      />
       <header className="topbar">
         <a className="brand" href="#studio" aria-label="Sona home">
           so<span>na</span>

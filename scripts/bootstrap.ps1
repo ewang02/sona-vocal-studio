@@ -4,19 +4,21 @@
 
 .DESCRIPTION
   Checks for Node.js 22.13+, Python 3.13, FFmpeg, and FFprobe, offers to
-  install whatever is missing with winget, then runs `npm install` and
-  `npm run pipeline:setup`. Re-running it is safe: anything already present
-  is skipped.
+  install whatever is missing with winget, then runs `npm install`. The
+  optional local processing environment is installed from the app on first
+  use, or eagerly with -Pipeline. Re-running is safe.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
   powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -Yes
   powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -Check
+  powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -Pipeline
 #>
 [CmdletBinding()]
 param(
     [switch]$Yes,
-    [switch]$Check
+    [switch]$Check,
+    [switch]$Pipeline
 )
 
 $ErrorActionPreference = "Stop"
@@ -159,11 +161,19 @@ Write-Step "Installing JavaScript dependencies"
 & npm install
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Step "Setting up the Python pipeline"
-Write-Note "this downloads PyTorch and ~249 MiB of separation models; it can take several minutes"
-if ($script:PythonBin) { $env:PYTHON = $script:PythonBin }
-& npm run pipeline:setup
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($Pipeline) {
+    Write-Step "Setting up local song processing"
+    Write-Note "this downloads PyTorch and ~249 MiB of separation models; it can take several minutes"
+    if ($script:PythonBin -eq "py -3.13") {
+        $env:PYTHON = "py"
+        $env:PYTHON_ARGS = "-3.13"
+    } elseif ($script:PythonBin) {
+        $env:PYTHON = $script:PythonBin
+        Remove-Item Env:PYTHON_ARGS -ErrorAction SilentlyContinue
+    }
+    & npm run pipeline:setup
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
 Write-Step "Done"
 Write-Host @"
@@ -172,4 +182,5 @@ Start Sona with:
   npm start
 
 That runs the web interface and the local processing companion together.
+The first Add a song can install the optional processing tools in the app.
 "@

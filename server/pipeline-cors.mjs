@@ -1,8 +1,12 @@
-const DEPLOYED_ORIGINS = new Set([
-  "https://sona-vocal-studio.edwardwang070206.chatgpt.site",
-]);
+// No hosted origin is trusted by default. A deployment opts in explicitly with
+// PIPELINE_ALLOWED_ORIGINS so a companion never answers a site the user did not
+// name. Loopback development origins are allowed separately, below.
+const DEPLOYED_ORIGINS = new Set();
 
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const LOCAL_DEVELOPMENT_ORIGINS = new Set([
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+]);
 
 function configuredOrigins(value = process.env.PIPELINE_ALLOWED_ORIGINS || "") {
   return new Set(
@@ -35,14 +39,7 @@ export function allowedPipelineOrigin(
     ) {
       return url.origin;
     }
-    if (
-      (url.protocol === "http:" || url.protocol === "https:") &&
-      LOOPBACK_HOSTS.has(url.hostname) &&
-      !url.username &&
-      !url.password
-    ) {
-      return url.origin;
-    }
+    if (LOCAL_DEVELOPMENT_ORIGINS.has(url.origin)) return url.origin;
   } catch {
     // Invalid Origin headers are denied below.
   }
@@ -52,12 +49,17 @@ export function allowedPipelineOrigin(
 /** Apply standard CORS plus the browser opt-in for public-to-local requests. */
 export function applyPipelineCors(request, response) {
   const origin = allowedPipelineOrigin(request.headers.origin);
+  response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader(
     "Vary",
     "Origin, Access-Control-Request-Private-Network",
   );
-  response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+  response.setHeader("Access-Control-Allow-Headers", "Content-Type, Range, X-Sona-Action");
+  response.setHeader(
+    "Access-Control-Expose-Headers",
+    "Accept-Ranges, Content-Length, Content-Range",
+  );
   if (!origin) return;
 
   response.setHeader("Access-Control-Allow-Origin", origin);

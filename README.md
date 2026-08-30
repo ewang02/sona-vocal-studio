@@ -34,8 +34,9 @@ local processing companion will prepare it for the studio.
 
 ### 1. Set up Sona
 
-The setup script checks for everything Sona needs, offers to install whatever is
-missing, then installs the JavaScript and Python dependencies.
+The setup script checks the small system prerequisites, offers to install
+anything missing, and installs the web app. The large ML environment is
+optional until you add your first song.
 
 On macOS or Linux:
 
@@ -49,13 +50,10 @@ On Windows:
 powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 ```
 
-Pass `--check` to see what is missing without installing anything, or `--yes`
-to skip the confirmation prompt. Re-running is safe — anything already present
-is skipped. If you already have Node.js, `npm run setup` does the same thing.
-
-Setup creates a local Python environment and downloads about 249 MiB of
-vocal-separation models, verified by size and SHA-256 hash before use. Expect
-it to take several minutes the first time.
+Pass `--check` to see what is missing without installing anything, `--yes` to
+skip the confirmation prompt, or `--pipeline` to install song processing and
+models eagerly. Re-running is safe. If Node.js is already installed,
+`npm run setup` runs the same platform-aware setup.
 
 ### 2. Start Sona
 
@@ -63,10 +61,11 @@ it to take several minutes the first time.
 npm start
 ```
 
-That runs the web interface and the local song-processing companion together,
-and stops both when you press Ctrl-C. Open the URL it prints, choose **Add a
-song**, and select an MP3. The song appears in your library when processing
-finishes.
+That runs the web interface and its loopback-only local companion together.
+Open the printed URL and choose **Add a song**. On first use, Sona offers to
+install the Python tools and download about 249 MiB of separation models;
+downloads are size- and SHA-256-verified. The rest of the app works before that
+optional setup finishes.
 
 <details>
 <summary>Running the two parts separately</summary>
@@ -76,11 +75,11 @@ terminal:
 
 ```sh
 npm run dev        # web interface
-npm run pipeline   # local song-processing companion
+npm run companion  # private local library and song processing
 ```
 
 For the production build, run `npm run build`, then either `npm start -- --prod`
-or `npm run serve` alongside `npm run pipeline`.
+or `npm run serve` alongside `npm run companion`.
 
 </details>
 
@@ -157,27 +156,74 @@ WebGPU are also detected.
 For diagnostics, set `SONA_ACCELERATOR` to `cpu`, `cuda`, `coreml`, or
 `directml` before running setup and the pipeline. The default is `auto`.
 
-## Hosting the web interface
+## Host the interface without hosting user media
 
-Song processing still happens through the companion running on the user's
-computer. If a hosted Sona web interface needs to connect to that companion,
-allow the site's exact origin when starting it:
+The production build is already configured for Cloudflare Workers. Deploy the
+UI shell with:
 
 ```sh
-PIPELINE_ALLOWED_ORIGINS=https://studio.example.com npm run pipeline
+npm run deploy
 ```
 
-Separate multiple origins with commas. Local development origins are allowed
-automatically; other origins are denied by default.
+On a machine using the hosted UI, run only the local companion, naming the
+origin you deployed to so it will answer that page:
+
+```sh
+PIPELINE_ALLOWED_ORIGINS=https://studio.example.com npm run companion
+```
+
+The browser asks before the hosted page connects to `127.0.0.1`. Songs,
+generated stems, contours, models, and recordings remain on that computer; the
+Cloudflare Worker receives none of them. Sona waits for an explicit **Add a
+song** click before requesting local-network access.
+
+### Browser support for the hosted shell
+
+| Browser | Hosted UI + local companion |
+| --- | --- |
+| Chrome / Edge | Works. Chrome 142 and later show a Local Network Access prompt on the first connection; allow it. |
+| Firefox | Works. |
+| Safari | Not supported. Run Sona locally instead. |
+
+Loopback is a [potentially trustworthy origin](https://developer.mozilla.org/en-US/docs/Web/Security/Mixed_content),
+so an HTTPS page reaching `http://127.0.0.1` is not mixed content. WebKit has
+not adopted that rule ([bug 171934](https://bugs.webkit.org/show_bug.cgi?id=171934)),
+so Safari blocks the request no matter how the companion is configured. Sona
+detects this and says so rather than reporting the companion as down. Safari
+users should open `http://localhost:3000` with `npm start`, which is
+unaffected.
+
+No hosted origin is trusted by default. Name the exact origin you deploy to
+when starting the companion:
+
+```sh
+# macOS/Linux
+PIPELINE_ALLOWED_ORIGINS=https://studio.example.com npm run companion
+```
+
+```powershell
+# Windows PowerShell
+$env:PIPELINE_ALLOWED_ORIGINS="https://studio.example.com"; npm run companion
+```
+
+Separate multiple origins with commas. The companion binds only to
+`127.0.0.1`; unlisted browser origins are rejected before request bodies are
+read.
 
 ## Troubleshooting
 
 **The Add a song window says the processing companion is unavailable.**
 
-The companion is not running. Use `npm start`, which runs it alongside the web
-interface — or, if you start the two halves separately, run `npm run pipeline`
-in a second terminal and leave it open while adding the song. If this is your
-first run, complete the setup script first.
+The companion is not running. Use `npm start` for the fully local app, or keep
+`npm run companion` running when using a hosted copy. In Chrome, allow the
+site's Local Network Access request. In Safari, a hosted copy cannot reach the
+companion at all — use `npm start` and open `http://localhost:3000`.
+
+**The companion is running, but song processing needs setup.**
+
+Choose **Install locally** in the Add a song panel. If Python or FFmpeg is
+missing, run `npm run setup`, restart Sona, and try again. For an eager or
+headless install, use `npm run pipeline:setup`.
 
 **Microphone feedback or recording does not start.**
 
@@ -194,17 +240,20 @@ manually.
 
 ## Developer reference
 
-For a song id such as `example`, the pipeline creates:
+For a song id such as `example`, the companion creates:
 
 ```text
-public/audio/example.mp3
-public/audio/example-instrumental.mp3
-public/data/example-contour.json
-public/data/example-pyin.json
+.sona-data/library/audio/example.mp3
+.sona-data/library/audio/example-instrumental.mp3
+.sona-data/library/data/example-contour.json
+.sona-data/library/data/example-pyin.json
 ```
 
-It also adds the song to `public/library.json`. Intermediate analysis and cache
-data stay under `contour_out/` and are not added to the public library.
+It also updates `.sona-data/library/library.json`. Set `SONA_DATA_DIR` to use a
+different private local directory. Intermediate analysis and cache data stay
+under ignored local directories. `npm run build` refuses to run if song audio,
+contours, or model weights appear in `public/`, preventing an accidental media
+deployment.
 
 The main pipeline files are:
 
@@ -223,10 +272,12 @@ Model URLs, sizes, and hashes live in
 files are ignored by Git and should not be replaced without updating and
 revalidating that manifest.
 
-To process a song directly after setup:
+To process a song directly into the local library after setup:
 
 ```sh
-.venv/bin/python work/process_song.py example --mp3 /path/to/example.mp3
+.venv/bin/python work/process_song.py example \
+  --mp3 /path/to/example.mp3 \
+  --output-dir .sona-data/library
 ```
 
 The pipeline creates missing output directories automatically and can resume
@@ -247,7 +298,9 @@ The production web build is written to `dist/`.
 ## Responsible use
 
 Only process, record, and distribute material you are authorized to use. Sona
-does not include songs or generated contours.
+does not include songs or generated contours. Model weights are downloaded
+from their canonical upstream release only after an explicit local install;
+public availability is not itself a grant of reuse or redistribution rights.
 
 ## License
 

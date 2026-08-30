@@ -20,15 +20,8 @@ export default defineConfig(async () => {
 
   return {
     server: {
-      // Keep local uploads same-origin while the Python companion remains on
-      // its dedicated port.
-      proxy: {
-        "/api/pipeline": {
-          target: "http://localhost:4599",
-          changeOrigin: false,
-          rewrite: (path: string) => path.replace(/^\/api\/pipeline/, ""),
-        },
-      },
+      port: 3000,
+      strictPort: true,
     },
     plugins: [
       vinext(),

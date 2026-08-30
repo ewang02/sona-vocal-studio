@@ -244,7 +244,7 @@ def test_process_finishes_vocals_then_overlaps_instrumental_with_pitch_dag(
                 output.write_text("{}")
             return
         if "work/export_contour.py" in command:
-            output = tmp_path / "public" / "data" / f"{song}-contour.json"
+            output = tmp_path / ".sona-data" / "library" / "data" / f"{song}-contour.json"
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text("{}")
             (output.parent / f"{song}-pyin.json").write_text("{}")
@@ -279,7 +279,7 @@ def test_process_finishes_vocals_then_overlaps_instrumental_with_pitch_dag(
     )
     assert stages.index("vocal_separation") < stages.index("anchor_extraction")
     assert (
-        tmp_path / "public" / "audio" / f"{song}-instrumental.mp3"
+        tmp_path / ".sona-data" / "library" / "audio" / f"{song}-instrumental.mp3"
     ).read_bytes() == b"encoded instrumental"
 
 

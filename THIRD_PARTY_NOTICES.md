@@ -1,7 +1,7 @@
 # Third-party notices
 
-Sona uses and redistributes components from the following projects. These
-notices apply only to the identified third-party components, not to Sona as a
+Sona uses third-party components and redistributes only those identified as
+bundled below. These notices apply only to those components, not to Sona as a
 whole.
 
 ## SoundTouchJS
@@ -36,9 +36,15 @@ weights to Git. `npm run pipeline:setup` downloads the selected public UVR
 model assets from their canonical release URLs and verifies their exact sizes
 and SHA-256 hashes before use.
 
+The currently selected assets are `Kim_Inst.onnx`, `Kim_Vocal_2.onnx`, and
+`5_HP-Karaoke-UVR.pth`. They are neither embedded in hosted builds nor served
+by Sona's local companion. Installation is a separate, explicit local action.
+
 The public availability of a model asset is not itself a grant of additional
-rights. Users are responsible for confirming that their intended use of each
-downloaded model and processed recording is permitted.
+rights, and the MIT license on inference code does not necessarily determine
+the license of separately published weights. Distributors and users are
+responsible for confirming that their intended use of each downloaded model
+and processed recording is permitted.
 
 ## Other dependencies
 

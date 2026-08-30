@@ -96,7 +96,17 @@ class StageCache:
         }
 
     def _relative(self, path: Path) -> str:
-        return str(path.resolve().relative_to(self.root))
+        resolved = path.resolve()
+        try:
+            return str(resolved.relative_to(self.root))
+        except ValueError:
+            # Published library files may live in the user's OS application-data
+            # directory. Key them by a one-way location digest so cache records
+            # remain stable without writing a private absolute path to disk.
+            parent_digest = hashlib.sha256(
+                str(resolved.parent).encode("utf-8")
+            ).hexdigest()[:16]
+            return f"external/{parent_digest}/{resolved.name}"
 
     def is_hit(self, stage: str, payload: dict, outputs: Iterable[Path]) -> bool:
         with self._lock:

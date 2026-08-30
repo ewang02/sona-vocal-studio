@@ -6,9 +6,9 @@
  *   npm start            development server + pipeline
  *   npm start -- --prod  production server + pipeline (run `npm run build` first)
  *
- * Output from both is prefixed so it stays readable in one terminal. Ctrl-C
- * stops both, including the Python workers the pipeline spawns: those are
- * grandchildren, so the whole process group has to go, not just the pipeline.
+ * Output from both is prefixed so it stays readable in one terminal. The web
+ * interface stays usable if the optional companion cannot start. Ctrl-C stops
+ * both, including any Python workers spawned by the companion.
  */
 
 import { spawn } from "node:child_process";
@@ -65,8 +65,12 @@ function start(name, script) {
 
   child.on("error", (error) => {
     log(name, `failed to start: ${error.message}`);
-    exitCode = 1;
-    void stop();
+    if (name === "web") {
+      exitCode = 1;
+      void stop();
+    } else {
+      log(name, "The web interface will keep running; restart the companion with `npm run companion`.");
+    }
   });
 
   child.on("exit", (code, signal) => {
@@ -75,8 +79,12 @@ function start(name, script) {
     children.delete(name);
     if (shuttingDown) return;
     log(name, `exited (${signal ? `signal ${signal}` : `code ${code}`})`);
-    if (code) exitCode = code;
-    void stop();
+    if (name === "web") {
+      if (code) exitCode = code;
+      void stop();
+    } else {
+      log(name, "The web interface is still available without local song processing.");
+    }
   });
 
   children.set(name, child);
@@ -128,7 +136,7 @@ async function stop() {
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => void stop());
 
 process.stdout.write(
-  paint("dim", `Starting the ${production ? "production" : "development"} server and the pipeline.\n`) +
+  paint("dim", `Starting the ${production ? "production" : "development"} server and local companion.\n`) +
     paint("dim", "Press Ctrl-C to stop both.\n\n"),
 );
 

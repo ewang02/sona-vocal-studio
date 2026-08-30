@@ -43,6 +43,10 @@ tsconfig.tsbuildinfo
 
 # local song-processing environment and generated products
 /.venv/
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.sona-data/
 /experiments/
 /outputs/
 /public/audio/

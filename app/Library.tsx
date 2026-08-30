@@ -4,19 +4,24 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { formatTime } from "./pitch-utils";
 import {
   BUILTIN_CARDS,
+  fetchPipelineHealth,
+  fetchPipelineSetup,
   fetchJob,
   fetchLibrary,
   fileToBackground,
   getBackground,
-  pipelineAvailable,
   setBackground,
+  startPipelineSetup,
   STEP_LABELS,
   uploadSong,
   type JobStatus,
   type LibraryCard,
+  type SetupStatus,
 } from "./library-data";
+import { hostedLoopbackBlock, shouldAutoConnectForHostname } from "./loopback-access";
 
 const UPLOAD_STEPS = ["separating", "isolating", "tracking", "transcribing", "finalizing"];
+const MAX_UPLOAD_BYTES = 80 * 1024 * 1024;
 
 function ImageIcon() {
   return (
@@ -107,6 +112,8 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   const [cards, setCards] = useState<LibraryCard[]>(BUILTIN_CARDS);
   const [backgrounds, setBackgrounds] = useState<Record<string, string | null>>({});
   const [serverUp, setServerUp] = useState<boolean | null>(null);
+  const [pipelineReady, setPipelineReady] = useState(false);
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
 
   const [uploadOpen, setUploadOpen] = useState(false);
   const [file, setFile] = useState<File | null>(null);
@@ -115,6 +122,7 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   const [uploadError, setUploadError] = useState("");
   const [job, setJob] = useState<JobStatus | null>(null);
   const pollRef = useRef<number | null>(null);
+  const setupPollRef = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
     const list = await fetchLibrary();
@@ -126,19 +134,24 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   }, []);
 
   const checkPipeline = useCallback(async () => {
-    const available = await pipelineAvailable();
-    setServerUp(available);
-    return available;
+    const health = await fetchPipelineHealth();
+    setServerUp(health !== null);
+    setPipelineReady(health?.ready ?? false);
+    setSetupStatus(health?.setup ?? null);
+    return health;
   }, []);
 
   useEffect(() => {
-    // Initial library load + companion health probe. Both setState calls happen
-    // only after their awaited fetch resolves, not synchronously in this effect.
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- async client-only load
-    void refresh();
-    void checkPipeline();
+    // A hosted page waits for the user to click Add a song before asking for
+    // Local Network Access. Local development can connect without surprise.
+    if (shouldAutoConnectForHostname(window.location.hostname)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- both callbacks update only after awaited I/O
+      void refresh();
+      void checkPipeline();
+    }
     return () => {
       if (pollRef.current) window.clearTimeout(pollRef.current);
+      if (setupPollRef.current) window.clearTimeout(setupPollRef.current);
     };
   }, [checkPipeline, refresh]);
 
@@ -167,6 +180,7 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   }, []);
 
   const closeUpload = useCallback(() => {
+    if (setupPollRef.current) window.clearTimeout(setupPollRef.current);
     setUploadOpen(false);
     resetUpload();
   }, [resetUpload]);
@@ -174,8 +188,46 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   const openUpload = useCallback(() => {
     setUploadOpen(true);
     setServerUp(null);
-    void checkPipeline();
-  }, [checkPipeline]);
+    void (async () => {
+      const health = await checkPipeline();
+      if (health) await refresh();
+    })();
+  }, [checkPipeline, refresh]);
+
+  const pollSetup = useCallback(() => {
+    const tick = async () => {
+      try {
+        const status = await fetchPipelineSetup();
+        setSetupStatus(status.setup);
+        setPipelineReady(status.ready);
+        if (status.ready || status.setup.status === "error") return;
+        setupPollRef.current = window.setTimeout(tick, 1200);
+      } catch {
+        setSetupStatus({
+          status: "error",
+          message: "Lost connection during setup.",
+          error: "Keep the companion running and try again.",
+        });
+      }
+    };
+    void tick();
+  }, []);
+
+  const installPipeline = useCallback(async () => {
+    setSetupStatus({ status: "running", message: "Starting local setup…", error: null });
+    try {
+      const status = await startPipelineSetup();
+      setSetupStatus(status.setup);
+      setPipelineReady(status.ready);
+      if (!status.ready && status.setup.status !== "error") pollSetup();
+    } catch (error) {
+      setSetupStatus({
+        status: "error",
+        message: "Song-processing setup could not start.",
+        error: error instanceof Error ? error.message : "Try again from the companion terminal.",
+      });
+    }
+  }, [pollSetup]);
 
   const poll = useCallback(
     (jobId: string) => {
@@ -213,16 +265,26 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
       );
       return;
     }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setUploadError(`"${file.name}" is larger than the 80 MiB upload limit.`);
+      return;
+    }
     if (!title.trim()) {
       setUploadError("Give the song a title.");
       return;
     }
     setUploadError("");
     try {
-      if (!(await checkPipeline())) {
+      const health = await checkPipeline();
+      if (!health) {
         setUploadError(
-          "The pipeline is still unreachable from this page. Open localhost:3000 and try again.",
+          hostedLoopbackBlock() ??
+            "The local companion is still unreachable. Start it with npm run companion and try again.",
         );
+        return;
+      }
+      if (!health.ready) {
+        setUploadError("Install local song processing first.");
         return;
       }
       const { jobId, songId } = await uploadSong(file, title.trim(), artist.trim());
@@ -240,7 +302,7 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
     } catch (error) {
       setUploadError(
         error instanceof Error
-          ? `${error.message} — is the pipeline server running? (npm run pipeline)`
+          ? `${error.message} — is the local companion running? (npm run companion)`
           : "Upload failed.",
       );
     }
@@ -310,53 +372,102 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
 
             {!job && (
               <>
-                {serverUp === false && (
-                  <p className="uploadNotice">
-                    The pipeline server isn&apos;t responding. Use the local app at{" "}
-                    the address printed by <code>npm run dev</code>, keep{" "}
-                    <code>npm run pipeline</code> running, and allow local-network
-                    access if your browser asks.
-                  </p>
+                {serverUp === null && (
+                  <p className="uploadNotice">Connecting to your private local library…</p>
                 )}
-                <label className="uploadField">
-                  <span>MP3 file</span>
-                  <input
-                    type="file"
-                    accept="audio/mpeg,.mp3"
-                    onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-                  />
-                </label>
-                {file && <p className="uploadFileName">{file.name}</p>}
-                <label className="uploadField">
-                  <span>Title</span>
-                  <input
-                    type="text"
-                    value={title}
-                    placeholder="Song title"
-                    onChange={(event) => setTitle(event.target.value)}
-                  />
-                </label>
-                <label className="uploadField">
-                  <span>Artist <em>(optional)</em></span>
-                  <input
-                    type="text"
-                    value={artist}
-                    placeholder="Artist"
-                    onChange={(event) => setArtist(event.target.value)}
-                  />
-                </label>
-                {uploadError && <p className="uploadError">{uploadError}</p>}
-                <div className="uploadButtons">
-                  <button type="button" className="ghostButton" onClick={closeUpload}>
-                    Cancel
-                  </button>
-                  <button type="button" className="primaryButton" onClick={submitUpload}>
-                    Process song
-                  </button>
-                </div>
-                <p className="uploadFootnote">
-                  Runs Kim stem separation, lead-vocal isolation, pitch tracking, and transcription locally. Takes a few minutes.
-                </p>
+                {serverUp === false && (
+                  <>
+                    <p className="uploadNotice">
+                      {hostedLoopbackBlock() ?? (
+                        <>
+                          Sona&apos;s local companion isn&apos;t responding. Start it with{" "}
+                          <code>npm run companion</code>, then reopen this panel. Allow
+                          local-network access if your browser asks.
+                        </>
+                      )}
+                    </p>
+                    <div className="uploadButtons">
+                      <button type="button" className="ghostButton" onClick={closeUpload}>
+                        Close
+                      </button>
+                      <button type="button" className="primaryButton" onClick={openUpload}>
+                        Try again
+                      </button>
+                    </div>
+                  </>
+                )}
+                {serverUp === true && !pipelineReady && (
+                  <div className="jobProgress">
+                    <p className="jobHeadline">
+                      {setupStatus?.message || "Local song processing needs to be installed."}
+                    </p>
+                    <p className="uploadFootnote">
+                      This installs the Python audio tools and downloads about 249 MiB of
+                      third-party separation models directly to this computer. Models,
+                      songs, and recordings stay local. Model availability does not grant
+                      rights to use copyrighted material.
+                    </p>
+                    {setupStatus?.error && <p className="uploadError">{setupStatus.error}</p>}
+                    <div className="uploadButtons">
+                      <button type="button" className="ghostButton" onClick={closeUpload}>
+                        Not now
+                      </button>
+                      <button
+                        type="button"
+                        className="primaryButton"
+                        onClick={installPipeline}
+                        disabled={setupStatus?.status === "running"}
+                      >
+                        {setupStatus?.status === "running" ? "Installing…" : "Install locally"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {serverUp === true && pipelineReady && (
+                  <>
+                    <label className="uploadField">
+                      <span>MP3 file</span>
+                      <input
+                        type="file"
+                        accept="audio/mpeg,.mp3"
+                        onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+                      />
+                    </label>
+                    {file && <p className="uploadFileName">{file.name}</p>}
+                    <label className="uploadField">
+                      <span>Title</span>
+                      <input
+                        type="text"
+                        value={title}
+                        maxLength={120}
+                        placeholder="Song title"
+                        onChange={(event) => setTitle(event.target.value)}
+                      />
+                    </label>
+                    <label className="uploadField">
+                      <span>Artist <em>(optional)</em></span>
+                      <input
+                        type="text"
+                        value={artist}
+                        maxLength={120}
+                        placeholder="Artist"
+                        onChange={(event) => setArtist(event.target.value)}
+                      />
+                    </label>
+                    {uploadError && <p className="uploadError">{uploadError}</p>}
+                    <div className="uploadButtons">
+                      <button type="button" className="ghostButton" onClick={closeUpload}>
+                        Cancel
+                      </button>
+                      <button type="button" className="primaryButton" onClick={submitUpload}>
+                        Process song
+                      </button>
+                    </div>
+                    <p className="uploadFootnote">
+                      The MP3 is processed on this computer and stored only in your private local library. Takes a few minutes.
+                    </p>
+                  </>
+                )}
               </>
             )}
 

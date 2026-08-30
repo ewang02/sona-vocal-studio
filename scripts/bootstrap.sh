@@ -3,12 +3,14 @@
 # One-command setup for macOS and Linux.
 #
 # Checks for Node.js 22.13+, Python 3.13, FFmpeg, and FFprobe, offers to
-# install whatever is missing, then runs `npm install` and `npm run
-# pipeline:setup`. Re-running it is safe: anything already present is skipped.
+# install whatever is missing, then runs `npm install`. The optional Python/ML
+# environment is installed from the app on first use, or eagerly with
+# `--pipeline`. Re-running is safe: anything already present is skipped.
 #
 #   ./scripts/bootstrap.sh          install missing tools after confirming
 #   ./scripts/bootstrap.sh --yes    do not prompt
 #   ./scripts/bootstrap.sh --check  only report what is missing
+#   ./scripts/bootstrap.sh --pipeline  also install models now
 
 set -euo pipefail
 
@@ -20,10 +22,12 @@ REQUIRED_PYTHON="3.13"
 
 ASSUME_YES=0
 CHECK_ONLY=0
+INSTALL_PIPELINE=0
 for argument in "$@"; do
   case "$argument" in
     -y|--yes) ASSUME_YES=1 ;;
     --check) CHECK_ONLY=1 ;;
+    --pipeline) INSTALL_PIPELINE=1 ;;
     -h|--help)
       sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -228,9 +232,11 @@ fi
 step "Installing JavaScript dependencies"
 npm install
 
-step "Setting up the Python pipeline"
-note "this downloads PyTorch and ~249 MiB of separation models; it can take several minutes"
-PYTHON="$PYTHON_BIN" npm run pipeline:setup
+if [ "$INSTALL_PIPELINE" -eq 1 ]; then
+  step "Setting up local song processing"
+  note "this downloads PyTorch and ~249 MiB of separation models; it can take several minutes"
+  PYTHON="$PYTHON_BIN" npm run pipeline:setup
+fi
 
 step "Done"
 cat <<'EOF'
@@ -239,4 +245,5 @@ Start Sona with:
   npm start
 
 That runs the web interface and the local processing companion together.
+The first Add a song can install the optional processing tools in the app.
 EOF
