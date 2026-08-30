@@ -36,6 +36,8 @@ const MIC_NUDGE_MAX_MS = 250;
 const TRANSPOSE_MIN = -16;
 const TRANSPOSE_MAX = 16;
 const EDIT_STORAGE_PREFIX = "sona.editedContour.v1.";
+/** Pointer travel before a press in editing mode becomes a region drag. */
+const DRAG_THRESHOLD_PX = 4;
 
 
 const PAST_SECONDS = 2.6;
@@ -232,6 +234,7 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   const studioModeRef = useRef<StudioMode>(studioMode);
   const selectionRef = useRef<TimeSelection | null>(selection);
   const selectionAnchorRef = useRef<number | null>(null);
+  const selectionAnchorXRef = useRef<number | null>(null);
   const instrumentCaptureRef = useRef<ScriptProcessorNode | null>(null);
   const vocalCaptureRef = useRef<ScriptProcessorNode | null>(null);
   const captureSilentGainRef = useRef<GainNode | null>(null);
@@ -1014,40 +1017,39 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     if (studioModeRef.current !== "editing" || event.button !== 0) return;
     event.preventDefault();
     audioRef.current?.pause();
-    const time = selectionTimeAt(event.clientX);
-    selectionAnchorRef.current = time;
-    const next = { t0: time, t1: time };
-    selectionRef.current = next;
-    setSelection(next);
-    setSelecting(true);
+    // A press clears the previous region and only arms a drag. The selection
+    // itself is not created until the pointer travels past DRAG_THRESHOLD_PX,
+    // so a plain click cancels instead of leaving a sliver behind.
+    selectionAnchorRef.current = selectionTimeAt(event.clientX);
+    selectionAnchorXRef.current = event.clientX;
+    selectionRef.current = null;
+    setSelection(null);
+    setSelecting(false);
     event.currentTarget.setPointerCapture(event.pointerId);
   }, [selectionTimeAt]);
 
   const moveContourSelection = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     const anchor = selectionAnchorRef.current;
-    if (studioModeRef.current !== "editing" || anchor === null) return;
+    const anchorX = selectionAnchorXRef.current;
+    if (studioModeRef.current !== "editing" || anchor === null || anchorX === null) return;
+    if (Math.abs(event.clientX - anchorX) < DRAG_THRESHOLD_PX) return;
     const next = normalizeSelection({ t0: anchor, t1: selectionTimeAt(event.clientX) });
     selectionRef.current = next;
     setSelection(next);
+    setSelecting(true);
   }, [selectionTimeAt]);
 
   const finishContourSelection = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-    const anchor = selectionAnchorRef.current;
-    if (anchor === null) return;
-    const next = normalizeSelection({ t0: anchor, t1: selectionTimeAt(event.clientX) });
-    const minimum = melodyRef.current.hop;
-    const finalSelection =
-      next.t1 - next.t0 < minimum
-        ? { t0: Math.max(0, next.t0 - minimum), t1: Math.min(melodyRef.current.duration, next.t1 + minimum) }
-        : next;
+    if (selectionAnchorRef.current === null) return;
     selectionAnchorRef.current = null;
-    selectionRef.current = finalSelection;
-    setSelection(finalSelection);
+    selectionAnchorXRef.current = null;
+    // selectionRef is non-null only once a drag passed the threshold; a click
+    // therefore ends with the selection already cleared by the press.
     setSelecting(false);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-  }, [selectionTimeAt]);
+  }, []);
 
   const applyContourEdit = useCallback((action: "remove" | "smooth" | "repair") => {
     const selected = selectionRef.current;
@@ -1732,10 +1734,12 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
           <strong className="songTitle">{song.title}</strong>
           <span className="songArtist">{song.artist}</span>
         </div>
-        <div className="heroStats" aria-label="Session metrics">
-          <div className="heroStat"><span>Score</span><strong>{score === null ? "—" : score.toLocaleString("en-US")}{score !== null && <small>/10k</small>}</strong></div>
-          <div className="heroStat"><span>Accuracy</span><strong>{accuracy === null ? "—" : accuracy}{accuracy !== null && <small>% · {rankForAccuracy(accuracy)}</small>}</strong></div>
-        </div>
+        {studioMode !== "editing" && (
+          <div className="heroStats" aria-label="Session metrics">
+            <div className="heroStat"><span>Score</span><strong>{score === null ? "—" : score.toLocaleString("en-US")}{score !== null && <small>/10k</small>}</strong></div>
+            <div className="heroStat"><span>Accuracy</span><strong>{accuracy === null ? "—" : accuracy}{accuracy !== null && <small>% · {rankForAccuracy(accuracy)}</small>}</strong></div>
+          </div>
+        )}
       </section>
 
       <div className="studioLayout" id="studio">
