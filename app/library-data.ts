@@ -6,6 +6,7 @@
  * build assets.
  */
 
+import { loadStored, removeStored, saveStored } from "./local-store";
 import { SONGS } from "./songs";
 import type { ContourData, Song } from "./songs";
 
@@ -86,26 +87,23 @@ export async function resolveSong(card: LibraryCard): Promise<Song> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-song background image — downscaled JPEG kept in localStorage (per device,
-// no backend), keyed by song id.
+// Per-song background image — a downscaled JPEG kept on this device (no
+// backend), keyed by song id. Stored in IndexedDB: a few of these would fill
+// localStorage's quota.
 // ---------------------------------------------------------------------------
 
 const BG_PREFIX = "sona.bg.";
 
-export function getBackground(id: string): string | null {
-  try {
-    return window.localStorage.getItem(BG_PREFIX + id);
-  } catch {
-    return null;
-  }
+export function getBackground(id: string): Promise<string | null> {
+  return loadStored<string>(BG_PREFIX + id, (raw) => raw);
 }
 
-export function setBackground(id: string, dataUrl: string | null): void {
+export async function setBackground(id: string, dataUrl: string | null): Promise<void> {
   try {
-    if (dataUrl) window.localStorage.setItem(BG_PREFIX + id, dataUrl);
-    else window.localStorage.removeItem(BG_PREFIX + id);
+    if (dataUrl) await saveStored(BG_PREFIX + id, dataUrl);
+    else await removeStored(BG_PREFIX + id);
   } catch {
-    // Private mode or quota exceeded: the choice simply does not persist.
+    // Storage blocked or full: the choice simply does not persist.
   }
 }
 

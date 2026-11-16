@@ -163,7 +163,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if ($Pipeline) {
     Write-Step "Setting up local song processing"
-    Write-Note "this downloads PyTorch and ~249 MiB of separation models; it can take several minutes"
+    Write-Note "this downloads PyTorch and the separation models (~1.7 GiB with GPU acceleration, ~250 MiB otherwise); it can take several minutes"
     if ($script:PythonBin -eq "py -3.13") {
         $env:PYTHON = "py"
         $env:PYTHON_ARGS = "-3.13"

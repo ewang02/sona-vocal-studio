@@ -6,22 +6,45 @@ import test from "node:test";
 
 import {
   MODEL_MANIFEST_PATH,
+  profileAssets,
   readModelManifest,
   sha256File,
   verifyModelAsset,
 } from "../scripts/model-assets.mjs";
 
-test("model manifest contains canonical HTTPS assets and pinned hashes", () => {
+test("model manifest pins every asset of both separator profiles", () => {
   const manifest = readModelManifest();
+  assert.deepEqual(Object.keys(manifest.profiles).sort(), ["compact", "roformer"]);
   assert.deepEqual(
-    manifest.assets.map((asset) => asset.filename).sort(),
+    profileAssets(manifest, "compact").map((asset) => asset.filename).sort(),
     ["5_HP-Karaoke-UVR.pth", "Kim_Inst.onnx", "Kim_Vocal_2.onnx"],
   );
-  for (const asset of manifest.assets) {
+  assert.deepEqual(
+    profileAssets(manifest, "roformer").map((asset) => asset.filename).sort(),
+    [
+      "config_mel_band_roformer_karaoke_gabox.yaml",
+      "mel_band_roformer_karaoke_gabox.ckpt",
+      "vocals_mel_band_roformer.ckpt",
+      "vocals_mel_band_roformer.yaml",
+    ],
+  );
+  for (const asset of profileAssets(manifest, "compact")) {
     assert.match(asset.url, /^https:\/\/github\.com\/TRvlvr\/model_repo\//);
-    assert.match(asset.sha256, /^[a-f0-9]{64}$/);
     assert.ok(asset.size > 50 * 1024 * 1024);
   }
+  for (const asset of profileAssets(manifest, "roformer")) {
+    assert.match(asset.url, /^https:\/\/github\.com\/nomadkaraoke\/python-audio-separator\//);
+    // Weights are large; each one's small config is pinned alongside it so
+    // nothing is fetched outside the verified path at first run.
+    if (asset.filename.endsWith(".ckpt")) assert.ok(asset.size > 500 * 1024 * 1024);
+    else assert.ok(asset.filename.endsWith(".yaml") && asset.size < 64 * 1024);
+  }
+  for (const profile of Object.keys(manifest.profiles)) {
+    for (const asset of profileAssets(manifest, profile)) {
+      assert.match(asset.sha256, /^[a-f0-9]{64}$/);
+    }
+  }
+  assert.throws(() => profileAssets(manifest, "missing"), /Unknown separator profile/);
   assert.doesNotThrow(() => JSON.parse(readFileSync(MODEL_MANIFEST_PATH, "utf8")));
 });
 

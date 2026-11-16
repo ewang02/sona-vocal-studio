@@ -134,6 +134,83 @@ export function editContour(
   return framesToContour(contour, frames);
 }
 
+/**
+ * A take is captured as contiguous chunks, each stamped by the audio thread
+ * with the AudioContext time of its first sample. Placing a chunk in the song
+ * needs one more number: the offset between the context clock and the song
+ * position. That offset is constant while playback runs, but it can only be
+ * read from the main thread, and for the first moments after play() the media
+ * element has not started advancing, so early readings are too high.
+ *
+ * A "run" is one uninterrupted stretch of recording. Every chunk in a run is
+ * placed with the same offset, which keeps the run sample-contiguous. While
+ * the run is settling, the newest offset reading re-places the whole run;
+ * after that the offset is frozen.
+ */
+export type CaptureRun = {
+  firstBlock: number;
+  /** Context time of each block's first sample, kept only while settling. */
+  clocks: number[];
+  settled: boolean;
+  /** Seconds between the sound and its arrival in the graph. */
+  latencySeconds: number;
+};
+
+export type CaptureTimeline = {
+  blocks: PcmBlock[];
+  run: CaptureRun | null;
+};
+
+export const CAPTURE_SETTLE_SECONDS = 0.5;
+
+export function createCaptureTimeline(): CaptureTimeline {
+  return { blocks: [], run: null };
+}
+
+/** Start a new run: call when recording starts, resumes, or the song seeks. */
+export function beginCaptureRun(
+  timeline: CaptureTimeline,
+  latencySeconds: number,
+): void {
+  timeline.run = {
+    firstBlock: timeline.blocks.length,
+    clocks: [],
+    settled: false,
+    latencySeconds,
+  };
+}
+
+export function appendCapture(
+  timeline: CaptureTimeline,
+  channels: Float32Array[],
+  sampleRate: number,
+  /** Context time of the chunk's first sample. */
+  clock: number,
+  /** Song position minus context time, read now. */
+  clockToSongOffset: number,
+): void {
+  if (!timeline.run) beginCaptureRun(timeline, 0);
+  const run = timeline.run as CaptureRun;
+  if (run.settled) {
+    // Continue exactly where the run's frozen mapping says this clock falls.
+    const first = timeline.blocks[run.firstBlock];
+    const runOffset = first.start - run.clocks[0];
+    timeline.blocks.push({ start: clock + runOffset, sampleRate, channels });
+    return;
+  }
+  run.clocks.push(clock);
+  timeline.blocks.push({ start: 0, sampleRate, channels });
+  const shift = clockToSongOffset - run.latencySeconds;
+  for (let index = 0; index < run.clocks.length; index += 1) {
+    timeline.blocks[run.firstBlock + index].start = run.clocks[index] + shift;
+  }
+  if (clock - run.clocks[0] >= CAPTURE_SETTLE_SECONDS) {
+    run.settled = true;
+    // Keep only the first clock: it anchors the frozen mapping above.
+    run.clocks.length = 1;
+  }
+}
+
 export function trimPcmBlocks(blocks: PcmBlock[], cutoff: number): PcmBlock[] {
   const safeCutoff = Math.max(0, cutoff);
   const result: PcmBlock[] = [];
@@ -166,15 +243,24 @@ export function renderPcmTrack(
   const sampleCount = Math.max(1, Math.ceil(Math.max(0, duration) * sampleRate));
   const output = Array.from({ length: outputChannels }, () => new Float32Array(sampleCount));
   for (const block of blocks) {
-    const destinationStart = Math.max(0, Math.round(block.start * sampleRate));
+    const position = Math.round(block.start * sampleRate);
+    // Latency compensation can place the first block before 0:00. Crop the
+    // part that falls outside the song rather than sliding the block later.
+    const sourceStart = Math.max(0, -position);
+    const destinationStart = Math.max(0, position);
     const sourceLength = block.channels[0]?.length ?? 0;
     for (let channel = 0; channel < outputChannels; channel += 1) {
       const source = block.channels[Math.min(channel, block.channels.length - 1)];
       if (!source) continue;
-      const limit = Math.min(sourceLength, output[channel].length - destinationStart);
-      for (let index = 0; index < limit; index += 1) {
-        output[channel][destinationStart + index] = source[index];
-      }
+      const limit = Math.min(
+        sourceLength - sourceStart,
+        output[channel].length - destinationStart,
+      );
+      if (limit <= 0) continue;
+      output[channel].set(
+        source.subarray(sourceStart, sourceStart + limit),
+        destinationStart,
+      );
     }
   }
   return output;
@@ -242,4 +328,38 @@ export function encodeWav(channels: Float32Array[], sampleRate: number): Blob {
     }
   }
   return new Blob([buffer], { type: "audio/wav" });
+}
+
+export type TakeRenderRequest = {
+  instrumental: PcmBlock[];
+  vocals: PcmBlock[];
+  sampleRate: number;
+};
+
+export type TakeRenderResult = {
+  vocals: Blob;
+  instrumental: Blob;
+  combined: Blob;
+  duration: number;
+};
+
+/** Render a finished take to its three WAV files. Pure; runs in a worker. */
+export function renderTake(request: TakeRenderRequest): TakeRenderResult | null {
+  const { sampleRate } = request;
+  const duration = [...request.instrumental, ...request.vocals].reduce(
+    (maximum, block) => Math.max(maximum, pcmBlockEnd(block)),
+    0,
+  );
+  if (duration <= 0) return null;
+  const instrumental = renderPcmTrack(request.instrumental, 2, sampleRate, duration);
+  const vocals = renderPcmTrack(request.vocals, 1, sampleRate, duration);
+  const instrumentalWav = encodeWav(instrumental, sampleRate);
+  const vocalsWav = encodeWav(vocals, sampleRate);
+  const combinedWav = encodeWav(mixPcm(instrumental, vocals), sampleRate);
+  return {
+    vocals: vocalsWav,
+    instrumental: instrumentalWav,
+    combined: combinedWav,
+    duration,
+  };
 }

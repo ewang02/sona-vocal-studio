@@ -18,7 +18,7 @@
     "build": "node scripts/check-public-assets.mjs && vinext build && node scripts/check-public-assets.mjs --dist",
     "serve": "vinext start",
     "deploy": "npm run build && wrangler deploy --config dist/server/wrangler.json",
-    "test": "npm run build && node --experimental-strip-types --test tests/rendered-html.test.mjs tests/studio-utils.test.mts tests/hosted-loopback.test.mts tests/pipeline-cors.test.mjs tests/local-library.test.mjs tests/local-companion.test.mjs tests/setup-flow.test.mjs tests/rolldown-binding.test.mjs tests/inference-backend.test.mjs tests/model-assets.test.mjs",
+    "test": "npm run build && node --experimental-strip-types --test tests/rendered-html.test.mjs tests/studio-utils.test.mts tests/pitch-filter.test.mts tests/pitch-worklet.test.mjs tests/recorder-worklet.test.mjs tests/hosted-loopback.test.mts tests/pipeline-cors.test.mjs tests/local-library.test.mjs tests/local-companion.test.mjs tests/setup-flow.test.mjs tests/rolldown-binding.test.mjs tests/inference-backend.test.mjs tests/model-assets.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {

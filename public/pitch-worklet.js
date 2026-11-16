@@ -22,6 +22,14 @@ const YIN_THRESHOLD = 0.15;
 const CANDIDATE_MARGIN = 0.12;
 const CONTINUITY_WEIGHT = 60;
 const CONTINUITY_MEMORY_S = 0.18;
+// Period refinement. At 16 kHz a 1 kHz note has a 16-sample period, and
+// parabolic interpolation of so coarse a dip reads 5-10 cents sharp. The
+// difference function dips again at every whole multiple of the period, and a
+// dip k periods out locates the period k times more finely. Follow the dips
+// outward by doubling, accepting one only while it stays nearly as deep as the
+// fundamental dip (a gliding note smears the far dips, and then the coarse
+// estimate is the honest one).
+const MULTIPLE_MARGIN = 0.08;
 
 class SonaPitchProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -51,6 +59,9 @@ class SonaPitchProcessor extends AudioWorkletProcessor {
       sampleRate,
       window: WINDOW,
       hop: HOP,
+      // Spacing of pitch messages, so the main thread can account for the lag
+      // of any frame-count filter it applies on top.
+      hopSeconds: HOP / this.detectorRate,
       // Age of the pitch estimate when it is posted: the buffer must fill
       // before analysis, and the estimate describes its first WINDOW samples.
       analysisLatency: (this.frameLength - WINDOW * 0.5) / this.detectorRate,
@@ -188,13 +199,22 @@ class SonaPitchProcessor extends AudioWorkletProcessor {
     const clarity = Math.max(0, Math.min(1, 1 - cmnd[candidate]));
     let refinedTau = candidate;
     if (candidate > this.tauMin && candidate < this.tauMax) {
-      const left = cmnd[candidate - 1];
-      const center = cmnd[candidate];
-      const right = cmnd[candidate + 1];
-      const denominator = left - 2 * center + right;
-      if (Math.abs(denominator) > 1e-12) {
-        refinedTau += Math.max(-1, Math.min(1, 0.5 * (left - right) / denominator));
+      refinedTau = this.interpolateDip(candidate);
+      const ceiling = cmnd[candidate] + MULTIPLE_MARGIN;
+      let multiple = 1;
+      let lag = refinedTau;
+      while (2 * lag < this.tauMax - 1) {
+        // The dip at twice the current lag is within a sample of 2 * lag.
+        const expected = Math.round(2 * lag);
+        let dip = expected;
+        if (cmnd[expected - 1] < cmnd[dip]) dip = expected - 1;
+        if (cmnd[expected + 1] < cmnd[dip]) dip = expected + 1;
+        const isDip = cmnd[dip] <= cmnd[dip - 1] && cmnd[dip] <= cmnd[dip + 1];
+        if (!isDip || cmnd[dip] > ceiling) break;
+        lag = this.interpolateDip(dip);
+        multiple *= 2;
       }
+      refinedTau = lag / multiple;
     }
 
     const frequency = this.detectorRate / refinedTau;
@@ -205,6 +225,16 @@ class SonaPitchProcessor extends AudioWorkletProcessor {
       this.lastF0Time = timestamp;
     }
     this.postPitch(timestamp, valid ? frequency : null, clarity, rms);
+  }
+
+  /** Sub-sample position of the CMND minimum at an interior lag. */
+  interpolateDip(tau) {
+    const left = this.cmnd[tau - 1];
+    const center = this.cmnd[tau];
+    const right = this.cmnd[tau + 1];
+    const denominator = left - 2 * center + right;
+    if (Math.abs(denominator) <= 1e-12) return tau;
+    return tau + Math.max(-1, Math.min(1, 0.5 * (left - right) / denominator));
   }
 
   postPitch(t, f0, clarity, rms) {

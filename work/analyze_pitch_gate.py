@@ -98,12 +98,16 @@ def otsu_diagnostics(values: np.ndarray, threshold: float) -> dict[str, float]:
     }
 
 
+DIGITAL_SILENCE_RMS = 1.0 / 32768.0
+
+
 def choose_rms_floor(
     rms: np.ndarray,
     config: ContourPipelineConfig = BASELINE_CONFIG,
 ) -> tuple[float, dict]:
-    nonzero = np.asarray(rms, dtype=float)
-    nonzero = nonzero[np.isfinite(nonzero) & (nonzero > 0)]
+    values = np.asarray(rms, dtype=float)
+    values = values[np.isfinite(values)]
+    nonzero = values[values > 0]
     if not len(nonzero):
         return 0.0, {
             "method": "empty",
@@ -113,7 +117,14 @@ def choose_rms_floor(
             "separability": 0.0,
             "valleyRatio": 1.0,
         }
-    log_rms = np.log10(nonzero)
+    # A separator that leaves true digital silence between phrases produces
+    # frames of exactly zero. Dropping them removes the whole "silence" class,
+    # and Otsu then splits the singing itself into quiet and loud, putting the
+    # floor far too high and trimming soft notes and note edges. Count those
+    # frames as silence at one 16-bit step instead. Only exact zeros are
+    # substituted, so stems with a residual noise floor, which contain none,
+    # get exactly the floor they always did.
+    log_rms = np.log10(np.where(values > 0, values, DIGITAL_SILENCE_RMS))
     threshold = otsu(log_rms)
     diagnostics = otsu_diagnostics(log_rms, threshold)
     otsu_floor = 10 ** threshold * config.rms_otsu_multiplier

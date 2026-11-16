@@ -2,26 +2,34 @@
 
 import type { SoundTouchNode as SoundTouchNodeType } from "@soundtouchjs/audio-worklet";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { loadStored, removeStored, saveStored } from "./local-store";
+import {
+  DEFAULT_CAPTURE_LATENCY_S,
+  startPitchTracker,
+  type PitchTracker,
+} from "./pitch-tracker";
 import {
   clamp,
   classifyVoiceRange,
-  createAdaptivePitchFilter,
+  foldToOctave,
   formatTime,
   midiToName,
   percentile,
 } from "./pitch-utils";
 import type { ContourData, Song } from "./songs";
 import {
+  appendCapture,
+  beginCaptureRun,
+  createCaptureTimeline,
   editContour,
-  encodeWav,
-  mixPcm,
   normalizeSelection,
-  pcmBlockEnd,
-  renderPcmTrack,
+  renderTake,
   trimPcmBlocks,
-  type PcmBlock,
+  type CaptureTimeline,
   type RepairSourceData,
   type StudioMode,
+  type TakeRenderRequest,
+  type TakeRenderResult,
   type TimeSelection,
 } from "./studio-utils";
 
@@ -31,6 +39,15 @@ type InputMode = "demo" | "microphone";
 // sessions. The measured chain covers analysis and scheduling exactly but the
 // capture path is device-dependent and unqueryable in most browsers.
 const MIC_NUDGE_STORAGE_KEY = "sona.micNudgeMs";
+// Whether the backing track plays through speakers (the microphone hears it)
+// and whether singing in another octave earns credit. Both are per device.
+const SPEAKERS_STORAGE_KEY = "sona.usingSpeakers";
+const OCTAVE_FREE_STORAGE_KEY = "sona.octaveFreeScoring";
+const RECORDER_WORKLET_URL = "/recorder-worklet.js?v=1";
+const RECORDER_WORKLET_NAME = "sona-recorder-processor";
+// The recorder hands over its final partial chunk a moment after it is told
+// to stop; wait this long before treating a take as complete.
+const CAPTURE_TAIL_MS = 80;
 const MIC_NUDGE_MIN_MS = -100;
 const MIC_NUDGE_MAX_MS = 250;
 const TRANSPOSE_MIN = -16;
@@ -59,14 +76,6 @@ const NATURAL_PITCH_CLASSES = new Set([0, 2, 4, 5, 7, 9, 11]);
 // second, which drags the target note around under the singer. Use measured
 // constants instead, and bypass the shifter entirely at the original key.
 const SHIFTER_LATENCY_S = 0.046;
-// MediaStreamTrack.getSettings().latency is not implemented by every browser.
-// Use a modest input-path estimate when it is unavailable; unlike
-// AudioContext.baseLatency, this represents capture rather than playback.
-const DEFAULT_CAPTURE_LATENCY_S = 0.025;
-// The 5-frame median in the adaptive filter reports the middle sample, so it
-// trails the newest frame by two hops.
-const FILTER_MEDIAN_LAG_S = (2 * 512) / 48000;
-const DEFAULT_ANALYSIS_LATENCY_S = (1024 + 600 - 512) / 48000;
 
 // Scoring: 9000 points are spread across the song's voiced frames by
 // duration; each frame pays out its share times the singer's credit. The
@@ -109,7 +118,63 @@ function displayMidiName(midi: number) {
 }
 
 function sameContour(left: ContourData, right: ContourData) {
-  return JSON.stringify(left.segments) === JSON.stringify(right.segments);
+  return (
+    left === right ||
+    left.segments === right.segments ||
+    JSON.stringify(left.segments) === JSON.stringify(right.segments)
+  );
+}
+
+type TakeWorkerMessage =
+  | { ready: true }
+  | { ok: true; result: TakeRenderResult | null }
+  | { ok: false; error: string };
+
+/**
+ * Render a take's WAV files in a worker so the page stays responsive. The
+ * sample buffers are transferred, not copied, but only once the worker has
+ * announced itself: if it cannot load, they are still here for the inline
+ * fallback.
+ */
+function renderTakeOffThread(request: TakeRenderRequest): Promise<TakeRenderResult | null> {
+  let worker: Worker;
+  try {
+    worker = new Worker(new URL("./recording-worker.ts", import.meta.url), { type: "module" });
+  } catch {
+    return Promise.resolve(renderTake(request));
+  }
+  return new Promise((resolve, reject) => {
+    let handedOver = false;
+    const finish = (settle: () => void) => {
+      worker.terminate();
+      settle();
+    };
+    worker.onmessage = (event: MessageEvent<TakeWorkerMessage>) => {
+      const message = event.data;
+      if ("ready" in message) {
+        handedOver = true;
+        const buffers = [...request.instrumental, ...request.vocals].flatMap((block) =>
+          block.channels.map((channel) => channel.buffer as ArrayBuffer),
+        );
+        worker.postMessage(request, buffers);
+        return;
+      }
+      if (message.ok) finish(() => resolve(message.result));
+      else finish(() => reject(new Error(message.error)));
+    };
+    worker.onerror = () => {
+      finish(() => {
+        if (handedOver) reject(new Error("The take could not be rendered."));
+        else {
+          try {
+            resolve(renderTake(request));
+          } catch (error) {
+            reject(error);
+          }
+        }
+      });
+    };
+  });
 }
 
 function segmentIndexAt(segments: Segment[], time: number) {
@@ -152,6 +217,8 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   const [micBusy, setMicBusy] = useState(false);
   const [micError, setMicError] = useState("");
   const [micNudgeMs, setMicNudgeMs] = useState(0);
+  const [usingSpeakers, setUsingSpeakers] = useState(false);
+  const [octaveFree, setOctaveFree] = useState(false);
   // Practice starts on the instrumental. Editing opts into the original mix;
   // recording can monitor that mix while exporting only the instrumental.
   const [guideVocals, setGuideVocals] = useState(false);
@@ -190,26 +257,28 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   const soundTouchRef = useRef<SoundTouchNodeType | null>(null);
   const guideSoundTouchRef = useRef<SoundTouchNodeType | null>(null);
   const outputLatencyRef = useRef(0);
-  const micLatencyRef = useRef(0);
   const captureLatencyRef = useRef(DEFAULT_CAPTURE_LATENCY_S);
-  const analysisLatencyRef = useRef(DEFAULT_ANALYSIS_LATENCY_S);
-  const micClockOriginRef = useRef<number | null>(null);
+  // AudioContext time the newest filtered pitch was sung at the microphone's
+  // input, already corrected for the filter's own lag.
   const livePitchSampleTimeRef = useRef<number | null>(null);
   const livePitchEventRef = useRef(0);
   const drawnPitchEventRef = useRef(0);
   const shifterBypassedRef = useRef(true);
   const mediaSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   const guideMediaSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const micNodeRef = useRef<AudioWorkletNode | null>(null);
-  const micSilentGainRef = useRef<GainNode | null>(null);
-  const micModuleContextRef = useRef<AudioContext | null>(null);
+  const trackerRef = useRef<PitchTracker | null>(null);
+  const micDeviceKeyRef = useRef("");
   const micRequestGenerationRef = useRef(0);
+  const usingSpeakersRef = useRef(false);
+  const octaveFreeRef = useRef(false);
+  const lastTargetRef = useRef<number | null>(null);
+  // Keeps the instrumental element flowing through the graph (and so keeps
+  // its clock running) while only the guide mix is audible.
+  const keepAliveGainRef = useRef<GainNode | null>(null);
+  const disposedRef = useRef(false);
   // Try the microphone automatically on first play; cleared when the user
   // explicitly chooses demo input or when mic access fails.
   const autoMicRef = useRef(true);
-  const adaptiveFilterRef = useRef(createAdaptivePitchFilter());
   const songTransposeRef = useRef(songTranspose);
   const contourTransposeRef = useRef(contourTranspose);
   const guideVocalsRef = useRef(guideVocals);
@@ -235,12 +304,17 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   const selectionRef = useRef<TimeSelection | null>(selection);
   const selectionAnchorRef = useRef<number | null>(null);
   const selectionAnchorXRef = useRef<number | null>(null);
-  const instrumentCaptureRef = useRef<ScriptProcessorNode | null>(null);
-  const vocalCaptureRef = useRef<ScriptProcessorNode | null>(null);
+  const instrumentCaptureRef = useRef<AudioWorkletNode | null>(null);
+  const vocalCaptureRef = useRef<AudioWorkletNode | null>(null);
   const captureSilentGainRef = useRef<GainNode | null>(null);
+  const recorderModuleContextRef = useRef<AudioContext | null>(null);
   const recordingActiveRef = useRef(false);
-  const instrumentalBlocksRef = useRef<PcmBlock[]>([]);
-  const vocalBlocksRef = useRef<PcmBlock[]>([]);
+  // Bumped on every start and whenever a take is discarded; recorder chunks
+  // carrying an older number are stale and dropped.
+  const captureEpochRef = useRef(0);
+  const recordedUiRef = useRef(0);
+  const instrumentalTimelineRef = useRef<CaptureTimeline>(createCaptureTimeline());
+  const vocalTimelineRef = useRef<CaptureTimeline>(createCaptureTimeline());
   const recordingFilesRef = useRef<RecordingFiles | null>(null);
 
   // The edited contour is flattened for O(1) target lookup by frame index.
@@ -303,11 +377,16 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   );
   const targetDisplay = targetPitch === null ? null : targetPitch + contourTranspose;
   // Signed: positive when the singer is sharp (above center), negative when flat.
+  // With any-octave scoring the singer is compared against the nearest octave
+  // of the target, while the readout still names the note they actually sang.
+  const comparedPitch =
+    livePitch !== null && targetDisplay !== null && octaveFree
+      ? foldToOctave(livePitch, targetDisplay)
+      : livePitch;
   const pitchOffset =
-    livePitch !== null && targetDisplay !== null ? livePitch - targetDisplay : null;
+    comparedPitch !== null && targetDisplay !== null ? comparedPitch - targetDisplay : null;
   const pitchDistance = pitchOffset === null ? null : Math.abs(pitchOffset);
   const isInside = pitchDistance !== null && pitchDistance <= INNER_BAND;
-  const primaryGuideVocals = studioMode !== "recording" && guideVocals;
 
   const startAudioTime = useCallback(() => {
     const firstSegment = melodyRef.current.segments[0];
@@ -329,6 +408,7 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     livePitchSampleTimeRef.current = null;
     drawnPitchEventRef.current = livePitchEventRef.current;
     hitActiveRef.current = false;
+    lastTargetRef.current = null;
     scoringSegmentRef.current = -1;
     lastScoreTimeRef.current = audioTime;
     setScore(null);
@@ -337,29 +417,73 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     setTargetPitch(null);
   }, []);
 
-  const setMicNudge = useCallback((valueMs: number) => {
+  const applyMicNudge = useCallback((valueMs: number) => {
     const next = clamp(Math.round(valueMs), MIC_NUDGE_MIN_MS, MIC_NUDGE_MAX_MS);
     micNudgeSecondsRef.current = next / 1000;
     setMicNudgeMs(next);
+    return next;
+  }, []);
+
+  // Capture delay differs a lot between a wired headset and a Bluetooth one,
+  // so the trim is remembered per input device as well as globally; the
+  // global value seeds a device that has not been tuned yet.
+  const setMicNudge = useCallback((valueMs: number) => {
+    const next = applyMicNudge(valueMs);
     try {
       window.localStorage.setItem(MIC_NUDGE_STORAGE_KEY, String(next));
+      if (micDeviceKeyRef.current) {
+        window.localStorage.setItem(
+          `${MIC_NUDGE_STORAGE_KEY}.${micDeviceKeyRef.current}`,
+          String(next),
+        );
+      }
     } catch {
       // Private mode or blocked storage: the nudge still applies this session.
     }
-  }, []);
+  }, [applyMicNudge]);
 
-  // Restore the saved nudge after mount (not in the initializer: this page is
-  // server-rendered first, and reading storage there would desync hydration —
-  // the effect-based restore is React's documented pattern for local storage).
+  const restoreDeviceNudge = useCallback((deviceKey: string) => {
+    micDeviceKeyRef.current = deviceKey;
+    if (!deviceKey) return;
+    try {
+      const stored = window.localStorage.getItem(`${MIC_NUDGE_STORAGE_KEY}.${deviceKey}`);
+      if (stored !== null && Number.isFinite(Number(stored))) applyMicNudge(Number(stored));
+    } catch {
+      // Unreadable storage: keep the current trim.
+    }
+  }, [applyMicNudge]);
+
+  // Restore saved preferences after mount (not in the initializers: this page
+  // is server-rendered first, and reading storage there would desync
+  // hydration — the effect-based restore is React's documented pattern for
+  // local storage).
   useEffect(() => {
     try {
       const stored = window.localStorage.getItem(MIC_NUDGE_STORAGE_KEY);
       // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot client-only state restore; a render pass cannot know this value
-      if (stored !== null && Number.isFinite(Number(stored))) setMicNudge(Number(stored));
+      if (stored !== null && Number.isFinite(Number(stored))) applyMicNudge(Number(stored));
+      if (window.localStorage.getItem(SPEAKERS_STORAGE_KEY) === "1") {
+        usingSpeakersRef.current = true;
+        setUsingSpeakers(true);
+      }
+      if (window.localStorage.getItem(OCTAVE_FREE_STORAGE_KEY) === "1") {
+        octaveFreeRef.current = true;
+        setOctaveFree(true);
+      }
     } catch {
-      // Unreadable storage: keep the default of 0 ms.
+      // Unreadable storage: keep the defaults.
     }
-  }, [setMicNudge]);
+  }, [applyMicNudge]);
+
+  const changeOctaveFree = useCallback((next: boolean) => {
+    octaveFreeRef.current = next;
+    setOctaveFree(next);
+    try {
+      window.localStorage.setItem(OCTAVE_FREE_STORAGE_KEY, next ? "1" : "0");
+    } catch {
+      // The choice still applies this session.
+    }
+  }, []);
 
   useEffect(() => {
     studioModeRef.current = studioMode;
@@ -374,25 +498,28 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   }, [recordingFiles]);
 
   useEffect(() => {
-    const storageKey = EDIT_STORAGE_PREFIX + song.id;
-    try {
-      const stored = window.localStorage.getItem(storageKey);
-      if (stored) {
-        const parsed = JSON.parse(stored) as ContourData;
-        if (
-          parsed &&
-          parsed.hop === song.contour.hop &&
-          parsed.duration === song.contour.duration &&
-          Array.isArray(parsed.segments)
-        ) {
-          // eslint-disable-next-line react-hooks/set-state-in-effect -- client-only saved contour
-          setEditedContour(parsed);
-          setSavedContour(parsed);
-        }
+    let cancelled = false;
+    void loadStored<ContourData>(
+      EDIT_STORAGE_PREFIX + song.id,
+      (raw) => JSON.parse(raw) as ContourData,
+    ).then((stored) => {
+      if (
+        cancelled ||
+        !stored ||
+        stored.hop !== song.contour.hop ||
+        stored.duration !== song.contour.duration ||
+        !Array.isArray(stored.segments)
+      ) {
+        // Missing, unreadable, or from a different analysis of this song: use
+        // the immutable shipped source.
+        return;
       }
-    } catch {
-      // Invalid or unavailable local storage: use the immutable shipped source.
-    }
+      setEditedContour(stored);
+      setSavedContour(stored);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [song]);
 
   useEffect(() => {
@@ -452,22 +579,20 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   }, []);
 
   // What the singer hears is delayed by the output chain; what we hear back
-  // from them is delayed by the independent capture path. baseLatency belongs
-  // only to the former. Pitch-message timestamps account for analysis and
-  // scheduling delay frame by frame; this static value is the fallback until
-  // the worklet clock is available.
+  // from them is delayed by the independent capture path, which the pitch
+  // tracker models. baseLatency belongs only to the former.
   const refreshLatencies = useCallback(() => {
     const context = audioContextRef.current;
     const base = context ? context.baseLatency || 0 : 0;
     const output = context && Number.isFinite(context.outputLatency) ? context.outputLatency : 0;
     outputLatencyRef.current =
       base + output + (shifterBypassedRef.current ? 0 : SHIFTER_LATENCY_S);
-    micLatencyRef.current =
-      captureLatencyRef.current + analysisLatencyRef.current + FILTER_MEDIAN_LAG_S;
   }, []);
 
-  // In recording mode the instrumental remains the capture source. Optional
-  // guide vocals replace only the monitored output with the full mix.
+  // The instrumental element is always the transport clock and the capture
+  // source. Guide vocals swap only what is audible: the original mix from the
+  // second element replaces the instrumental at the speakers, in every mode,
+  // without reloading or losing the place in the song.
   const applyAudioRouting = useCallback(
     (useShifter: boolean) => {
       const context = audioContextRef.current;
@@ -483,16 +608,12 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
           // A node that was never connected has nothing to unwind.
         }
       }
-      const monitorGuide =
-        studioModeRef.current === "recording" && guideVocalsRef.current;
-      if (useShifter) {
-        source.connect(shifter);
-        if (!monitorGuide) shifter.connect(context.destination);
-        if (instrumentCaptureRef.current) shifter.connect(instrumentCaptureRef.current);
-      } else {
-        if (!monitorGuide) source.connect(context.destination);
-        if (instrumentCaptureRef.current) source.connect(instrumentCaptureRef.current);
-      }
+      const monitorGuide = guideVocalsRef.current;
+      const instrumentalOut = useShifter ? shifter : source;
+      if (useShifter) source.connect(shifter);
+      if (!monitorGuide) instrumentalOut.connect(context.destination);
+      else if (keepAliveGainRef.current) instrumentalOut.connect(keepAliveGainRef.current);
+      if (instrumentCaptureRef.current) instrumentalOut.connect(instrumentCaptureRef.current);
       if (monitorGuide) {
         if (useShifter) {
           guideSource.connect(guideShifter);
@@ -545,6 +666,10 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
         soundTouchRef.current = shifter;
         guideMediaSourceRef.current = guideSource;
         guideSoundTouchRef.current = guideShifter;
+        const keepAlive = context.createGain();
+        keepAlive.gain.value = 0;
+        keepAlive.connect(context.destination);
+        keepAliveGainRef.current = keepAlive;
         audioContextRef.current = context;
         applyAudioRouting(songTransposeRef.current !== 0);
         return context;
@@ -562,6 +687,35 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     }
   }, [applyAudioRouting]);
 
+  // Bring the guide element in step with the instrumental, or silence it.
+  // Called whenever playback starts, stops, or the guide switch changes.
+  const syncGuide = useCallback(() => {
+    const audio = audioRef.current;
+    const guideAudio = guideAudioRef.current;
+    if (!audio || !guideAudio) return;
+    if (!guideVocalsRef.current || audio.paused) {
+      guideAudio.pause();
+      return;
+    }
+    const align = () => {
+      guideAudio.currentTime = clamp(
+        audio.currentTime,
+        0,
+        Math.max(0, guideAudio.duration || audio.duration || 0),
+      );
+    };
+    if (guideAudio.readyState >= HTMLMediaElement.HAVE_METADATA) align();
+    else guideAudio.addEventListener("loadedmetadata", align, { once: true });
+    void guideAudio.play().catch((error: unknown) => {
+      // A pause that lands before playback begins rejects with AbortError;
+      // that is an ordinary stop, not a failure to play.
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      guideVocalsRef.current = false;
+      setGuideVocals(false);
+      setMicError("Guide vocals could not start; the instrumental is playing instead.");
+    });
+  }, []);
+
   const clearRecordingFiles = useCallback(() => {
     const files = recordingFilesRef.current;
     if (files) {
@@ -573,51 +727,111 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     setRecordingFiles(null);
   }, []);
 
+  const setCaptureActive = useCallback((active: boolean) => {
+    const message = { active, epoch: captureEpochRef.current };
+    instrumentCaptureRef.current?.port.postMessage(message);
+    vocalCaptureRef.current?.port.postMessage(message);
+  }, []);
+
+  // Every uninterrupted stretch of recording is one "run" placed in the song
+  // with a single clock offset (see CaptureTimeline). The instrumental reaches
+  // its recorder late only by the pitch shifter. A sung note is later than the
+  // moment it belongs to by everything between the song clock and the
+  // singer's ears, plus everything between their mouth and the recorder.
+  const beginCaptureRuns = useCallback(() => {
+    beginCaptureRun(
+      instrumentalTimelineRef.current,
+      shifterBypassedRef.current ? 0 : SHIFTER_LATENCY_S,
+    );
+    beginCaptureRun(
+      vocalTimelineRef.current,
+      outputLatencyRef.current + captureLatencyRef.current + micNudgeSecondsRef.current,
+    );
+  }, []);
+
+  const startCapture = useCallback(() => {
+    captureEpochRef.current += 1;
+    recordingActiveRef.current = true;
+    beginCaptureRuns();
+    setCaptureActive(true);
+  }, [beginCaptureRuns, setCaptureActive]);
+
+  const stopCapture = useCallback(() => {
+    recordingActiveRef.current = false;
+    setCaptureActive(false);
+  }, [setCaptureActive]);
+
+  /** Drop everything captured so far, including any chunk still in flight. */
+  const discardCapture = useCallback((cutoff: number | null) => {
+    captureEpochRef.current += 1;
+    for (const timeline of [instrumentalTimelineRef, vocalTimelineRef]) {
+      timeline.current = {
+        blocks: cutoff === null ? [] : trimPcmBlocks(timeline.current.blocks, cutoff),
+        run: null,
+      };
+    }
+  }, []);
+
   const ensureRecordingCapture = useCallback(async () => {
     const context = await ensureAudioGraph();
+    if (recorderModuleContextRef.current !== context) {
+      await context.audioWorklet.addModule(RECORDER_WORKLET_URL);
+      recorderModuleContextRef.current = context;
+    }
     if (!captureSilentGainRef.current) {
       const silent = context.createGain();
       silent.gain.value = 0;
       silent.connect(context.destination);
       captureSilentGainRef.current = silent;
     }
-    const captureBlock = (
-      event: AudioProcessingEvent,
-      channels: number,
-      destination: React.MutableRefObject<PcmBlock[]>,
-      latencySeconds: number,
+    const silentGain = captureSilentGainRef.current;
+    const createRecorder = (
+      channels: 1 | 2,
+      timeline: React.MutableRefObject<CaptureTimeline>,
     ) => {
-      if (!recordingActiveRef.current) return;
-      const length = event.inputBuffer.length;
-      const blockDuration = length / context.sampleRate;
-      const copied = Array.from({ length: channels }, (_, channel) => {
-        const availableChannel = Math.min(channel, event.inputBuffer.numberOfChannels - 1);
-        return new Float32Array(event.inputBuffer.getChannelData(availableChannel));
+      const node = new AudioWorkletNode(context, RECORDER_WORKLET_NAME, {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        channelCount: channels,
+        channelCountMode: "explicit",
+        channelInterpretation: "speakers",
+        processorOptions: { channelCount: channels },
       });
-      destination.current.push({
-        start: Math.max(0, currentTimeRef.current - blockDuration - latencySeconds),
-        sampleRate: context.sampleRate,
-        channels: copied,
-      });
-      setRecordedUntil((current) => Math.max(current, currentTimeRef.current));
+      node.port.onmessage = (event: MessageEvent) => {
+        const data = event.data as {
+          type: string;
+          epoch: number;
+          frame: number;
+          channels: Float32Array[];
+        };
+        const audio = audioRef.current;
+        if (data.type !== "chunk" || data.epoch !== captureEpochRef.current || !audio) return;
+        appendCapture(
+          timeline.current,
+          data.channels,
+          context.sampleRate,
+          data.frame / context.sampleRate,
+          audio.currentTime - context.currentTime,
+        );
+        // The readout only needs to tick a few times a second.
+        const position = currentTimeRef.current;
+        if (position - recordedUiRef.current >= 0.25) {
+          recordedUiRef.current = position;
+          setRecordedUntil((current) => Math.max(current, position));
+        }
+      };
+      // The silent output keeps the node pulled by the destination.
+      node.connect(silentGain);
+      return node;
     };
     if (!instrumentCaptureRef.current) {
-      const node = context.createScriptProcessor(4096, 2, 2);
-      node.onaudioprocess = (event) => {
-        captureBlock(event, 2, instrumentalBlocksRef, 0);
-      };
-      node.connect(captureSilentGainRef.current);
-      instrumentCaptureRef.current = node;
+      instrumentCaptureRef.current = createRecorder(2, instrumentalTimelineRef);
       applyAudioRouting(songTransposeRef.current !== 0);
     }
     if (!vocalCaptureRef.current) {
-      const node = context.createScriptProcessor(4096, 1, 1);
-      node.onaudioprocess = (event) => {
-        captureBlock(event, 1, vocalBlocksRef, captureLatencyRef.current);
-      };
-      node.connect(captureSilentGainRef.current);
-      vocalCaptureRef.current = node;
-      micSourceRef.current?.connect(node);
+      vocalCaptureRef.current = createRecorder(1, vocalTimelineRef);
+      trackerRef.current?.source.connect(vocalCaptureRef.current);
     }
     return context;
   }, [applyAudioRouting, ensureAudioGraph]);
@@ -645,46 +859,23 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   // is navigation, not a fresh take).
   const skipBy = useCallback((delta: number) => {
     if (recordingActiveRef.current) {
-      recordingActiveRef.current = false;
+      stopCapture();
       audioRef.current?.pause();
       guideAudioRef.current?.pause();
       setRecordingStatus("paused");
     }
     seekTo(currentTimeRef.current + delta, false);
-  }, [seekTo]);
+  }, [seekTo, stopCapture]);
 
   const stopMicrophone = useCallback(() => {
     micRequestGenerationRef.current += 1;
-    if (micNodeRef.current) {
-      micNodeRef.current.port.onmessage = null;
-      micNodeRef.current.port.close();
-      micNodeRef.current.disconnect();
-    }
-    micSourceRef.current?.disconnect();
-    micSilentGainRef.current?.disconnect();
-    micStreamRef.current?.getTracks().forEach((track) => {
-      track.onended = null;
-      track.stop();
-    });
-    micNodeRef.current = null;
-    micSourceRef.current = null;
-    micSilentGainRef.current = null;
-    micStreamRef.current = null;
+    trackerRef.current?.stop();
+    trackerRef.current = null;
     livePitchRef.current = null;
     livePitchSampleTimeRef.current = null;
-    micClockOriginRef.current = null;
-    adaptiveFilterRef.current.reset();
   }, []);
 
-  const startMicrophone = useCallback(async (forceOn = false): Promise<boolean> => {
-    if (inputMode === "microphone") {
-      if (forceOn) return true;
-      autoMicRef.current = false;
-      stopMicrophone();
-      setInputMode("demo");
-      setMicError("");
-      return false;
-    }
+  const openMicrophone = useCallback(async (): Promise<boolean> => {
     const generation = ++micRequestGenerationRef.current;
     setMicBusy(true);
     setMicError("");
@@ -692,100 +883,20 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
       const context = await ensureAudioGraph();
       refreshLatencies();
       if (generation !== micRequestGenerationRef.current) return false;
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not supported in this browser.");
-      if (micModuleContextRef.current !== context) {
-        await context.audioWorklet.addModule("/pitch-worklet.js?v=mic-fix-2");
-        micModuleContextRef.current = context;
-      }
-      if (generation !== micRequestGenerationRef.current) return false;
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          // All three route the mic through the browser's voice-call
-          // processing, which gates and ducks a real condenser mic and adds
-          // its own delay. The backing track carries no lead vocal, so there
-          // is nothing to cancel: take the raw signal.
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          channelCount: 1,
-          // `latency` is in the Media Capture spec but not the DOM lib types.
-          latency: { ideal: 0 },
-        } as MediaTrackConstraints & { latency?: ConstrainDouble },
-      });
-      if (generation !== micRequestGenerationRef.current) {
-        stream.getTracks().forEach((track) => track.stop());
-        return false;
-      }
-      micStreamRef.current = stream;
-      const track = stream.getAudioTracks()[0];
-      const reportedCaptureLatency = (
-        track?.getSettings() as (MediaTrackSettings & { latency?: number }) | undefined
-      )?.latency;
-      captureLatencyRef.current =
-        Number.isFinite(reportedCaptureLatency) && (reportedCaptureLatency as number) > 0
-          ? (reportedCaptureLatency as number)
-          : DEFAULT_CAPTURE_LATENCY_S;
-      refreshLatencies();
-      const source = context.createMediaStreamSource(stream);
-      micSourceRef.current = source;
-      const node = new AudioWorkletNode(context, "sona-pitch-processor", {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        outputChannelCount: [1],
-      });
-      micNodeRef.current = node;
-      const silentGain = context.createGain();
-      micSilentGainRef.current = silentGain;
-      silentGain.gain.value = 0;
-      source.connect(node);
-      if (vocalCaptureRef.current) source.connect(vocalCaptureRef.current);
-      node.connect(silentGain);
-      silentGain.connect(context.destination);
-      adaptiveFilterRef.current.reset();
-      node.port.onmessage = (event: MessageEvent) => {
-        const data = event.data as {
-          type: string;
-          f0?: number | null;
-          clarity?: number;
-          rms?: number;
-          t?: number;
-          analysisLatency?: number;
-          contextTimeOrigin?: number;
-        };
-        if (data.type === "init") {
-          if (Number.isFinite(data.analysisLatency)) {
-            analysisLatencyRef.current = data.analysisLatency as number;
-            refreshLatencies();
-          }
-          return;
-        }
-        if (data.type === "clock") {
-          if (Number.isFinite(data.contextTimeOrigin)) {
-            micClockOriginRef.current = data.contextTimeOrigin as number;
-          }
-          return;
-        }
-        if (data.type !== "pitch") return;
-        const rms = data.rms ?? 0;
-        const clarity = data.clarity ?? 0;
-        const filtered = adaptiveFilterRef.current.process({
-          f0: data.f0 ?? null,
-          clarity,
-          rms,
-          timeMs: (data.t ?? context.currentTime) * 1000,
-        });
-        livePitchRef.current = filtered.midi;
-        livePitchSampleTimeRef.current =
-          micClockOriginRef.current !== null && Number.isFinite(data.t)
-            ? micClockOriginRef.current + (data.t as number) - FILTER_MEDIAN_LAG_S
-            : null;
-        livePitchEventRef.current += 1;
-      };
-      if (track) {
-        track.onended = () => {
-          if (micStreamRef.current !== stream) return;
+      const tracker = await startPitchTracker(context, {
+        speakers: usingSpeakersRef.current,
+        onPitch: (pitch) => {
+          livePitchRef.current = pitch.midi;
+          livePitchSampleTimeRef.current =
+            pitch.sampleTime === null
+              ? null
+              : pitch.sampleTime - (trackerRef.current?.filterLag() ?? 0);
+          livePitchEventRef.current += 1;
+        },
+        onEnded: () => {
+          if (generation !== micRequestGenerationRef.current) return;
           if (recordingActiveRef.current) {
-            recordingActiveRef.current = false;
+            stopCapture();
             audioRef.current?.pause();
             guideAudioRef.current?.pause();
             setRecordingStatus("paused");
@@ -794,8 +905,17 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
           stopMicrophone();
           setInputMode("demo");
           setMicError("Microphone disconnected; demo input is active.");
-        };
+        },
+      });
+      if (generation !== micRequestGenerationRef.current) {
+        tracker.stop();
+        return false;
       }
+      trackerRef.current = tracker;
+      captureLatencyRef.current = tracker.captureLatency;
+      restoreDeviceNudge(tracker.deviceKey);
+      refreshLatencies();
+      if (vocalCaptureRef.current) tracker.source.connect(vocalCaptureRef.current);
       setInputMode("microphone");
       return true;
     } catch (error) {
@@ -809,7 +929,35 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     } finally {
       if (generation === micRequestGenerationRef.current) setMicBusy(false);
     }
-  }, [ensureAudioGraph, inputMode, refreshLatencies, stopMicrophone]);
+  }, [ensureAudioGraph, refreshLatencies, restoreDeviceNudge, stopCapture, stopMicrophone]);
+
+  const startMicrophone = useCallback(async (forceOn = false): Promise<boolean> => {
+    if (inputMode === "microphone") {
+      if (forceOn) return true;
+      autoMicRef.current = false;
+      stopMicrophone();
+      setInputMode("demo");
+      setMicError("");
+      return false;
+    }
+    return openMicrophone();
+  }, [inputMode, openMicrophone, stopMicrophone]);
+
+  // Switching between headphones and speakers changes the capture
+  // constraints, so a live microphone has to be reopened to apply it.
+  const changeUsingSpeakers = useCallback((next: boolean) => {
+    usingSpeakersRef.current = next;
+    setUsingSpeakers(next);
+    try {
+      window.localStorage.setItem(SPEAKERS_STORAGE_KEY, next ? "1" : "0");
+    } catch {
+      // The choice still applies this session.
+    }
+    if (trackerRef.current) {
+      stopMicrophone();
+      void openMicrophone();
+    }
+  }, [openMicrophone, stopMicrophone]);
 
   const setSongKey = useCallback((value: number) => {
     const next = clamp(Math.round(value), TRANSPOSE_MIN, TRANSPOSE_MAX);
@@ -842,19 +990,18 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   }, [songTranspose, transpositionsLinked]);
 
   const pauseRecording = useCallback(() => {
-    recordingActiveRef.current = false;
+    stopCapture();
     audioRef.current?.pause();
     guideAudioRef.current?.pause();
     if (recordingStatus === "recording") setRecordingStatus("paused");
-  }, [recordingStatus]);
+  }, [recordingStatus, stopCapture]);
 
   const beginRecording = useCallback(async (reset = false) => {
     const audio = audioRef.current;
-    const guideAudio = guideAudioRef.current;
-    if (!audio || !guideAudio) return;
+    if (!audio) return;
     setRecordingError("");
     const micReady = inputMode === "microphone" || await startMicrophone(true);
-    if (!micReady || !micStreamRef.current) {
+    if (!micReady || !trackerRef.current) {
       setRecordingError("Microphone access is required to record a take.");
       return;
     }
@@ -862,121 +1009,119 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
       await ensureRecordingCapture();
       clearRecordingFiles();
       if (reset) {
-        instrumentalBlocksRef.current = [];
-        vocalBlocksRef.current = [];
+        discardCapture(null);
+        recordedUiRef.current = 0;
         setRecordedUntil(0);
         seekTo(0, true);
       }
-      recordingActiveRef.current = true;
       setRecordingStatus("recording");
+      // Route first: the capture runs read the shifter state it settles.
       applyAudioRouting(songTransposeRef.current !== 0);
-      if (guideVocals) {
-        if (guideAudio.readyState < HTMLMediaElement.HAVE_METADATA) {
-          await new Promise<void>((resolve, reject) => {
-            guideAudio.addEventListener("loadedmetadata", () => resolve(), { once: true });
-            guideAudio.addEventListener("error", () => reject(new Error("Guide vocals could not load.")), { once: true });
-          });
-        }
-        guideAudio.currentTime = clamp(
-          audio.currentTime,
-          0,
-          Math.max(0, guideAudio.duration || duration),
-        );
-        await Promise.all([audio.play(), guideAudio.play()]);
-      } else {
-        guideAudio.pause();
-        await audio.play();
-      }
+      startCapture();
+      // The element's play event starts the guide mix alongside it.
+      await audio.play();
     } catch (error) {
-      recordingActiveRef.current = false;
+      stopCapture();
       setRecordingStatus("paused");
       setRecordingError(error instanceof Error ? error.message : "Recording could not start.");
     }
   }, [
-    clearRecordingFiles,
-    ensureRecordingCapture,
-    guideVocals,
-    inputMode,
     applyAudioRouting,
-    duration,
+    clearRecordingFiles,
+    discardCapture,
+    ensureRecordingCapture,
+    inputMode,
     seekTo,
+    startCapture,
     startMicrophone,
+    stopCapture,
   ]);
 
   const restartRecording = useCallback(async () => {
-    recordingActiveRef.current = false;
+    stopCapture();
     audioRef.current?.pause();
     guideAudioRef.current?.pause();
-    instrumentalBlocksRef.current = [];
-    vocalBlocksRef.current = [];
+    discardCapture(null);
+    recordedUiRef.current = 0;
     setRecordedUntil(0);
     clearRecordingFiles();
     seekTo(0, true);
     setRecordingStatus("idle");
     await beginRecording(false);
-  }, [beginRecording, clearRecordingFiles, seekTo]);
+  }, [beginRecording, clearRecordingFiles, discardCapture, seekTo, stopCapture]);
 
   const rewindRecording = useCallback(() => {
-    recordingActiveRef.current = false;
+    stopCapture();
     audioRef.current?.pause();
     guideAudioRef.current?.pause();
     const cutoff = clamp(currentTimeRef.current, 0, duration);
-    instrumentalBlocksRef.current = trimPcmBlocks(instrumentalBlocksRef.current, cutoff);
-    vocalBlocksRef.current = trimPcmBlocks(vocalBlocksRef.current, cutoff);
+    discardCapture(cutoff);
+    recordedUiRef.current = Math.min(recordedUiRef.current, cutoff);
     setRecordedUntil((current) => Math.min(current, cutoff));
     clearRecordingFiles();
     setRecordingStatus("paused");
     seekTo(cutoff, false);
     setRecordingError("");
-  }, [clearRecordingFiles, duration, seekTo]);
+  }, [clearRecordingFiles, discardCapture, duration, seekTo, stopCapture]);
 
-  const endRecording = useCallback(() => {
-    recordingActiveRef.current = false;
+  const endRecording = useCallback(async () => {
+    stopCapture();
     audioRef.current?.pause();
     guideAudioRef.current?.pause();
     setRecordingStatus("processing");
     setRecordingError("");
-    const context = audioContextRef.current;
-    const sampleRate = context?.sampleRate ?? 48000;
-    const blocks = [...instrumentalBlocksRef.current, ...vocalBlocksRef.current];
-    const exportDuration = blocks.reduce(
-      (maximum, block) => Math.max(maximum, pcmBlockEnd(block)),
-      0,
-    );
-    if (exportDuration <= 0) {
+    await new Promise((resolve) => window.setTimeout(resolve, CAPTURE_TAIL_MS));
+    if (disposedRef.current) return;
+    const request: TakeRenderRequest = {
+      instrumental: instrumentalTimelineRef.current.blocks,
+      vocals: vocalTimelineRef.current.blocks,
+      sampleRate: audioContextRef.current?.sampleRate ?? 48000,
+    };
+    if (request.instrumental.length + request.vocals.length === 0) {
       setRecordingStatus("idle");
       setRecordingError("Record some audio before ending the take.");
       return;
     }
+    // The renderer takes ownership of the floating-point working buffers,
+    // which are far larger than the WAV files. A completed take is
+    // intentionally final.
+    discardCapture(null);
     clearRecordingFiles();
-    const instrumental = renderPcmTrack(
-      instrumentalBlocksRef.current,
-      2,
-      sampleRate,
-      exportDuration,
-    );
-    const vocals = renderPcmTrack(vocalBlocksRef.current, 1, sampleRate, exportDuration);
-    const combined = mixPcm(instrumental, vocals);
+    let rendered: TakeRenderResult | null = null;
+    try {
+      rendered = await renderTakeOffThread(request);
+    } catch (error) {
+      if (disposedRef.current) return;
+      recordedUiRef.current = 0;
+      setRecordedUntil(0);
+      setRecordingStatus("idle");
+      setRecordingError(error instanceof Error ? error.message : "The take could not be rendered.");
+      return;
+    }
+    if (disposedRef.current) return;
+    if (!rendered) {
+      recordedUiRef.current = 0;
+      setRecordedUntil(0);
+      setRecordingStatus("idle");
+      setRecordingError("Record some audio before ending the take.");
+      return;
+    }
     const files: RecordingFiles = {
-      vocals: URL.createObjectURL(encodeWav(vocals, sampleRate)),
-      instrumental: URL.createObjectURL(encodeWav(instrumental, sampleRate)),
-      combined: URL.createObjectURL(encodeWav(combined, sampleRate)),
-      duration: exportDuration,
+      vocals: URL.createObjectURL(rendered.vocals),
+      instrumental: URL.createObjectURL(rendered.instrumental),
+      combined: URL.createObjectURL(rendered.combined),
+      duration: rendered.duration,
       songTranspose: songTransposeRef.current,
     };
     recordingFilesRef.current = files;
     setRecordingFiles(files);
-    setRecordedUntil(exportDuration);
+    setRecordedUntil(rendered.duration);
     setRecordingStatus("complete");
-    // Object URLs now own the encoded WAV data; release the much larger
-    // floating-point working buffers. A completed take is intentionally final.
-    instrumentalBlocksRef.current = [];
-    vocalBlocksRef.current = [];
-  }, [clearRecordingFiles]);
+  }, [clearRecordingFiles, discardCapture, stopCapture]);
 
   const switchStudioMode = useCallback((nextMode: StudioMode) => {
     if (nextMode === studioModeRef.current) return;
-    recordingActiveRef.current = false;
+    stopCapture();
     audioRef.current?.pause();
     guideAudioRef.current?.pause();
     if (recordingStatus === "recording") setRecordingStatus("paused");
@@ -997,7 +1142,7 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     }
     setStudioMode(nextMode);
     applyAudioRouting(songTransposeRef.current !== 0);
-  }, [applyAudioRouting, recordingStatus]);
+  }, [applyAudioRouting, recordingStatus, stopCapture]);
 
   const selectionTimeAt = useCallback((clientX: number) => {
     const lane = laneRef.current;
@@ -1072,21 +1217,18 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
   }, [repairSource, resetPerformance]);
 
   const saveEditedDefault = useCallback(() => {
-    try {
-      window.localStorage.setItem(EDIT_STORAGE_PREFIX + song.id, JSON.stringify(editedContour));
-      setSavedContour(editedContour);
-      setEditNotice("Edited contour saved as the default on this device.");
-    } catch {
-      setEditNotice("This browser could not save the edited contour.");
-    }
+    const contour = editedContour;
+    void saveStored(EDIT_STORAGE_PREFIX + song.id, contour).then(
+      () => {
+        setSavedContour(contour);
+        setEditNotice("Edited contour saved as the default on this device.");
+      },
+      () => setEditNotice("This browser could not save the edited contour."),
+    );
   }, [editedContour, song.id]);
 
   const restoreOriginalContour = useCallback(() => {
-    try {
-      window.localStorage.removeItem(EDIT_STORAGE_PREFIX + song.id);
-    } catch {
-      // The shipped contour can still be restored for this session.
-    }
+    void removeStored(EDIT_STORAGE_PREFIX + song.id);
     setEditedContour(song.contour);
     setSavedContour(song.contour);
     setSelection(null);
@@ -1120,13 +1262,13 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
 
   const scrubTo = useCallback((time: number) => {
     if (recordingActiveRef.current) {
-      recordingActiveRef.current = false;
+      stopCapture();
       audioRef.current?.pause();
       guideAudioRef.current?.pause();
       setRecordingStatus("paused");
     }
     seekTo(time, studioModeRef.current !== "recording");
-  }, [seekTo]);
+  }, [seekTo, stopCapture]);
 
   // Transport keyboard shortcuts: Space toggles playback, ←/→ scrub 5 s. Skip
   // when a form control has focus so the keys still drive sliders and inputs.
@@ -1198,7 +1340,7 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     audio.pause();
     guideAudioRef.current?.pause();
     setPlaying(false);
-    audio.src = primaryGuideVocals ? song.audio : song.instrumental;
+    audio.src = song.instrumental;
     audio.load();
     contourScaleRef.current = 1;
     const startTime = startAudioTime();
@@ -1206,36 +1348,13 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     setCurrentTime(startTime);
     setDuration(song.contour.duration);
     resetPerformance(startTime);
-  }, [primaryGuideVocals, resetPerformance, song, startAudioTime]);
+  }, [resetPerformance, song, startAudioTime]);
 
   useEffect(() => {
     guideVocalsRef.current = guideVocals;
     applyAudioRouting(songTransposeRef.current !== 0);
-    const audio = audioRef.current;
-    const guideAudio = guideAudioRef.current;
-    if (
-      studioMode === "recording" &&
-      guideVocals &&
-      audio &&
-      guideAudio &&
-      !audio.paused
-    ) {
-      if (guideAudio.readyState >= HTMLMediaElement.HAVE_METADATA) {
-        guideAudio.currentTime = clamp(
-          audio.currentTime,
-          0,
-          Math.max(0, guideAudio.duration || duration),
-        );
-      }
-      void guideAudio.play().catch(() => {
-        setRecordingError("Guide vocals could not start; the instrumental is still recording.");
-        guideVocalsRef.current = false;
-        setGuideVocals(false);
-      });
-    } else {
-      guideAudio?.pause();
-    }
-  }, [applyAudioRouting, duration, guideVocals, studioMode]);
+    syncGuide();
+  }, [applyAudioRouting, guideVocals, syncGuide]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -1255,23 +1374,37 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
       setPlaying(false);
       guideAudioRef.current?.pause();
       if (recordingActiveRef.current) {
-        recordingActiveRef.current = false;
+        stopCapture();
         setRecordingStatus("paused");
       }
     };
-    const handlePlay = () => setPlaying(true);
-    const handlePause = () => setPlaying(false);
+    const handlePlay = () => {
+      setPlaying(true);
+      syncGuide();
+    };
+    const handlePause = () => {
+      setPlaying(false);
+      guideAudioRef.current?.pause();
+    };
+    // Fires when audio actually starts flowing: at the start of playback and
+    // again after any buffering stall. Either way the relation between the
+    // song clock and the context clock is new, so the capture runs restart.
+    const handlePlaying = () => {
+      if (recordingActiveRef.current) beginCaptureRuns();
+    };
     audio.addEventListener("loadedmetadata", handleLoaded);
     audio.addEventListener("ended", handleEnded);
     audio.addEventListener("play", handlePlay);
     audio.addEventListener("pause", handlePause);
+    audio.addEventListener("playing", handlePlaying);
     return () => {
       audio.removeEventListener("loadedmetadata", handleLoaded);
       audio.removeEventListener("ended", handleEnded);
       audio.removeEventListener("play", handlePlay);
       audio.removeEventListener("pause", handlePause);
+      audio.removeEventListener("playing", handlePlaying);
     };
-  }, [song, startAudioTime]);
+  }, [beginCaptureRuns, song, startAudioTime, stopCapture, syncGuide]);
 
   const drawLane = useCallback(
     (contourNow: number, nowMs: number, detected: number | null) => {
@@ -1540,8 +1673,8 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
         playing &&
         audio &&
         guideAudio &&
-        studioModeRef.current === "recording" &&
         guideVocalsRef.current &&
+        !guideAudio.paused &&
         Math.abs(guideAudio.currentTime - audio.currentTime) > 0.12
       ) {
         guideAudio.currentTime = clamp(
@@ -1562,10 +1695,12 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
       if (inputMode === "microphone") {
         const context = audioContextRef.current;
         const sampleTime = livePitchSampleTimeRef.current;
+        // Until the worklet has published its clock, fall back to the
+        // tracker's static estimate of the same delay.
         const measuredAge =
           context && sampleTime !== null
             ? context.currentTime - sampleTime + captureLatencyRef.current
-            : micLatencyRef.current;
+            : trackerRef.current?.fallbackAge() ?? 0;
         voiceNow = Math.max(
           0,
           contourNow - Math.max(0, measuredAge + micNudgeSecondsRef.current) * contourScale,
@@ -1578,12 +1713,22 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
         rawTarget === null ? null : rawTarget + contourTransposeRef.current;
 
       let detected = livePitchRef.current;
+      // The note the singer actually produced, for the readout; `detected` may
+      // be moved by whole octaves below.
+      let sung = detected;
       if (inputMode === "demo") {
         // Demo is a literal contour preview, so its trace should stay exactly
         // on the interpolated target rather than adding synthetic misses.
         detected = target;
+        sung = target;
         livePitchRef.current = detected;
+      } else if (detected !== null && octaveFreeRef.current) {
+        // Any-octave scoring: bring the voice to the octave of the target (or
+        // of the last target, between phrases) so the trace rides the wave.
+        const reference = target ?? lastTargetRef.current;
+        if (reference !== null) detected = foldToOctave(detected, reference);
       }
+      if (target !== null) lastTargetRef.current = target;
 
       const distance = detected !== null && target !== null ? Math.abs(detected - target) : null;
       if (distance !== null) {
@@ -1639,7 +1784,7 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
       if (nowMs - lastUiUpdateRef.current > UI_UPDATE_MS) {
         lastUiUpdateRef.current = nowMs;
         setCurrentTime(audioTime);
-        setLivePitch(detected);
+        setLivePitch(sung);
         setTargetPitch(rawTarget);
         setWaveNearby(
           segments.some(
@@ -1657,26 +1802,46 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
     };
   }, [drawLane, finalizeScoringSegment, inputMode, playing, targetMidiAt, updateScore]);
 
-  useEffect(() => () => {
-    recordingActiveRef.current = false;
-    const files = recordingFilesRef.current;
-    if (files) {
-      URL.revokeObjectURL(files.vocals);
-      URL.revokeObjectURL(files.instrumental);
-      URL.revokeObjectURL(files.combined);
-    }
-    stopMicrophone();
-    guideAudioRef.current?.pause();
-    instrumentCaptureRef.current?.disconnect();
-    vocalCaptureRef.current?.disconnect();
-    captureSilentGainRef.current?.disconnect();
-    guideMediaSourceRef.current?.disconnect();
-    guideSoundTouchRef.current?.disconnect();
-    audioContextRef.current?.close();
-  }, [stopMicrophone]);
+  useEffect(() => {
+    disposedRef.current = false;
+    const guideAudio = guideAudioRef.current;
+    return () => {
+      disposedRef.current = true;
+      stopCapture();
+      const files = recordingFilesRef.current;
+      if (files) {
+        URL.revokeObjectURL(files.vocals);
+        URL.revokeObjectURL(files.instrumental);
+        URL.revokeObjectURL(files.combined);
+      }
+      stopMicrophone();
+      guideAudio?.pause();
+      for (const capture of [instrumentCaptureRef.current, vocalCaptureRef.current]) {
+        if (!capture) continue;
+        capture.port.onmessage = null;
+        capture.port.close();
+        capture.disconnect();
+      }
+      instrumentCaptureRef.current = null;
+      vocalCaptureRef.current = null;
+      captureSilentGainRef.current?.disconnect();
+      keepAliveGainRef.current?.disconnect();
+      guideMediaSourceRef.current?.disconnect();
+      guideSoundTouchRef.current?.disconnect();
+      void audioContextRef.current?.close();
+    };
+  }, [stopCapture, stopMicrophone]);
 
-  const hasUnsavedEdits = !sameContour(editedContour, savedContour);
-  const hasSavedDefault = !sameContour(savedContour, song.contour);
+  // Comparing contours serializes both, so do it only when one changes rather
+  // than on every transport tick.
+  const hasUnsavedEdits = useMemo(
+    () => !sameContour(editedContour, savedContour),
+    [editedContour, savedContour],
+  );
+  const hasSavedDefault = useMemo(
+    () => !sameContour(savedContour, song.contour),
+    [savedContour, song.contour],
+  );
   const selectedRange = selection ? normalizeSelection(selection) : null;
   const takeLocksSongKey =
     studioMode === "recording" &&
@@ -1981,7 +2146,7 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
                 <button
                   className="secondaryRailButton endTakeButton"
                   type="button"
-                  onClick={endRecording}
+                  onClick={() => void endRecording()}
                   disabled={recordedUntil <= 0 || recordingStatus === "processing" || recordingStatus === "complete"}
                 >
                   End recording
@@ -2092,6 +2257,48 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
                 </div>
               </section>
 
+              <section className="railCard signalCard">
+                <div className="cardHeading signalHeading">
+                  <div>
+                    <h2>Any-octave scoring</h2>
+                    <p className="rangeNote">
+                      Sing the melody an octave above or below the target and still earn credit.
+                    </p>
+                  </div>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={octaveFree}
+                      onChange={(event) => changeOctaveFree(event.target.checked)}
+                      aria-label="Score the melody in any octave"
+                    />
+                    <span aria-hidden="true" />
+                  </label>
+                </div>
+              </section>
+
+              <section className="railCard signalCard">
+                <div className="cardHeading signalHeading">
+                  <div>
+                    <h2>Using speakers</h2>
+                    <p className="rangeNote">
+                      Turn on if the music plays out loud instead of through headphones, so the
+                      microphone does not score the song itself. Headphones track more accurately.
+                    </p>
+                  </div>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={usingSpeakers}
+                      onChange={(event) => changeUsingSpeakers(event.target.checked)}
+                      disabled={micBusy || recordingStatus === "recording"}
+                      aria-label="The music is playing through speakers"
+                    />
+                    <span aria-hidden="true" />
+                  </label>
+                </div>
+              </section>
+
               <section className="railCard transposeCard">
                 <div className="cardHeading">
                   <div><span className="eyebrow">Mic timing</span><h2>Sync your voice</h2></div>
@@ -2113,7 +2320,8 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
                 />
                 <p className="rangeNote">
                   If your trace lands after the wave even when you sing on time, raise this
-                  until they line up. Saved on this device.
+                  until they line up. Saved on this device for each microphone, and applied
+                  to recorded vocals too.
                 </p>
               </section>
             </>

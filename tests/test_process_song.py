@@ -5,6 +5,7 @@ from threading import Barrier, Event
 
 from work import build_final_transcriptions
 from work import process_song
+from work.hardware_acceleration import separator_profile
 from work.pipeline_cache import StageCache
 from work.separate_lead_vocals import resolve_source
 
@@ -13,7 +14,38 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_production_model_files_match_the_pinned_hashes() -> None:
-    assert process_song.validate_models() == process_song.MODEL_HASHES
+    # The profile this machine runs is the one setup downloaded.
+    expected = process_song.PROFILE_MODEL_HASHES[separator_profile()]
+    assert process_song.validate_models() == expected
+
+
+def test_each_separator_profile_pins_weights_and_their_configs() -> None:
+    assert set(process_song.PROFILE_MODEL_HASHES) == {"roformer", "compact"}
+    assert set(process_song.PROFILE_MODEL_HASHES["compact"]) == {
+        process_song.KIM_INST_MODEL,
+        process_song.KIM_VOCAL_MODEL,
+        process_song.LEAD_MODEL,
+    }
+    assert set(process_song.PROFILE_MODEL_HASHES["roformer"]) == {
+        process_song.ROFORMER_VOCAL_MODEL,
+        process_song.ROFORMER_VOCAL_CONFIG,
+        process_song.ROFORMER_LEAD_MODEL,
+        process_song.ROFORMER_LEAD_CONFIG,
+    }
+
+
+def test_stem_separator_command_names_both_products(tmp_path) -> None:
+    command = process_song.stem_separator_command(
+        tmp_path / "python",
+        tmp_path / "song.mp3",
+        process_song.ROFORMER_VOCAL_MODEL,
+        tmp_path / "stems" / "vocals.wav",
+        tmp_path / "stems" / "instrumental.wav",
+    )
+    assert command[1] == str(process_song.STEM_SEPARATOR)
+    assert command[command.index("--model") + 1] == "vocals_mel_band_roformer.ckpt"
+    assert command[command.index("--primary") + 1].endswith("vocals.wav")
+    assert command[command.index("--secondary") + 1].endswith("instrumental.wav")
 
 
 def test_separator_commands_use_the_selected_model_for_each_product_stem(tmp_path) -> None:
@@ -261,10 +293,11 @@ def test_process_finishes_vocals_then_overlaps_instrumental_with_pitch_dag(
     monkeypatch.setattr(process_song, "KIM_SEPARATOR", kim_helper)
     monkeypatch.setattr(process_song, "PYTHON", "python")
     monkeypatch.setattr(process_song, "StageCache", FakeCache)
+    monkeypatch.setattr(process_song, "separator_profile", lambda: "compact")
     monkeypatch.setattr(
         process_song,
         "validate_models",
-        lambda hash_file: dict(process_song.MODEL_HASHES),
+        lambda hash_file, profile: dict(process_song.PROFILE_MODEL_HASHES[profile]),
     )
     monkeypatch.setattr(process_song, "installed_versions", lambda *packages: {})
     monkeypatch.setattr(process_song, "command_version", lambda command: "ffmpeg")
@@ -281,6 +314,126 @@ def test_process_finishes_vocals_then_overlaps_instrumental_with_pitch_dag(
     assert (
         tmp_path / ".sona-data" / "library" / "audio" / f"{song}-instrumental.mp3"
     ).read_bytes() == b"encoded instrumental"
+
+
+def test_roformer_profile_separates_each_pair_in_one_pass_and_cleans_up(
+    tmp_path, monkeypatch
+) -> None:
+    song = "song"
+    source = tmp_path / f"{song}.mp3"
+    source.write_bytes(b"source")
+    stem_helper = tmp_path / "work" / "separate_stems.py"
+    stem_helper.parent.mkdir()
+    stem_helper.write_text("helper")
+    stages: list[str] = []
+    separations: list[tuple[str, str, str]] = []
+
+    class FakeCache:
+        def __init__(self, root, cache_song, cache_marker=print):
+            self.root = root
+
+        def file_hash(self, path: Path) -> str:
+            return process_song.sha256(path)
+
+        def code_hashes(self, paths) -> dict[str, str]:
+            return {}
+
+        def run(self, stage, payload, outputs, action, *, force=False):
+            stages.append(stage)
+            action()
+            assert all(path.is_file() for path in outputs)
+            return False
+
+    def fake_run(command: list[str]) -> None:
+        if len(command) > 1 and command[1] == str(stem_helper):
+            primary = Path(command[command.index("--primary") + 1])
+            secondary = Path(command[command.index("--secondary") + 1])
+            model = command[command.index("--model") + 1]
+            separations.append((model, primary.name, secondary.name))
+            primary.parent.mkdir(parents=True, exist_ok=True)
+            primary.write_bytes(b"primary")
+            secondary.write_bytes(b"secondary")
+            return
+        if "contour.py" in command:
+            output = tmp_path / "contour_out" / f"{song}_contour.csv"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("anchor")
+            return
+        if "work/build_final_transcriptions.py" in command:
+            if "--extract-only" in command:
+                output = (
+                    tmp_path / "contour_out" / "lead_contours" / f"{song}_contour.csv"
+                )
+            else:
+                output = (
+                    tmp_path
+                    / "experiments"
+                    / "transcription_final"
+                    / f"{song}_notes_final.json"
+                )
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("{}")
+            return
+        if "work/export_contour.py" in command:
+            output = tmp_path / ".sona-data" / "library" / "data" / f"{song}-contour.json"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("{}")
+            (output.parent / f"{song}-pyin.json").write_text("{}")
+            return
+        if command[0] == "ffmpeg":
+            Path(command[-1]).write_bytes(b"encoded instrumental")
+            return
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(process_song, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        process_song, "SEPARATOR_ROOT", tmp_path / "contour_out" / "separators"
+    )
+    monkeypatch.setattr(process_song, "STEM_SEPARATOR", stem_helper)
+    monkeypatch.setattr(process_song, "PYTHON", "python")
+    monkeypatch.setattr(process_song, "StageCache", FakeCache)
+    monkeypatch.setattr(process_song, "separator_profile", lambda: "roformer")
+    monkeypatch.setattr(
+        process_song,
+        "validate_models",
+        lambda hash_file, profile: dict(process_song.PROFILE_MODEL_HASHES[profile]),
+    )
+    monkeypatch.setattr(process_song, "installed_versions", lambda *packages: {})
+    monkeypatch.setattr(process_song, "command_version", lambda command: "ffmpeg")
+    monkeypatch.setattr(process_song, "ffprobe_duration", lambda path: 30.0)
+    monkeypatch.setattr(process_song, "run", fake_run)
+
+    duration = process_song.process(song, source, clean_intermediates=True)
+
+    assert duration == 30.0
+    # Two passes in total: the song into vocals + instrumental, then the
+    # vocals into lead + backing.
+    assert separations == [
+        (process_song.ROFORMER_VOCAL_MODEL, "vocals.wav", "instrumental.wav"),
+        (process_song.ROFORMER_LEAD_MODEL, "lead.wav", "backing.wav"),
+    ]
+    assert "stem_separation" in stages
+    assert "vocal_separation" not in stages
+    assert "instrumental_separation" not in stages
+    assert stages.index("stem_separation") < stages.index("anchor_extraction")
+    assert (
+        tmp_path / ".sona-data" / "library" / "audio" / f"{song}-instrumental.mp3"
+    ).read_bytes() == b"encoded instrumental"
+    # Published products stay; the bulky WAV stems are gone, the small
+    # contour evidence is kept.
+    assert not list((tmp_path / "contour_out").rglob("*.wav"))
+    assert (tmp_path / "contour_out" / f"{song}_contour.csv").is_file()
+
+
+def test_intermediate_stems_are_kept_unless_cleanup_is_requested(tmp_path) -> None:
+    stems = tmp_path / "separators" / "song"
+    stems.mkdir(parents=True)
+    (stems / "vocals.wav").write_bytes(b"1234")
+    (stems / "notes.json").write_text("{}")
+    assert process_song.remove_intermediate_audio([stems, tmp_path / "missing"]) == 4
+    assert not (stems / "vocals.wav").exists()
+    # A directory holding anything else is left in place.
+    assert (stems / "notes.json").is_file()
 
 
 def test_extract_only_keeps_the_exact_tiny_crepe_and_pyin_contract(

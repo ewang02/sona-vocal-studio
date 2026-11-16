@@ -126,9 +126,12 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
 
   const refresh = useCallback(async () => {
     const list = await fetchLibrary();
-    const nextBackgrounds: Record<string, string | null> = {};
-    for (const card of list) nextBackgrounds[card.id] = getBackground(card.id);
     setCards(list);
+    const stored = await Promise.all(list.map((card) => getBackground(card.id)));
+    const nextBackgrounds: Record<string, string | null> = {};
+    list.forEach((card, index) => {
+      nextBackgrounds[card.id] = stored[index];
+    });
     setBackgrounds(nextBackgrounds);
     return list;
   }, []);
@@ -158,7 +161,7 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   const pickBackground = useCallback(async (card: LibraryCard, chosen: File) => {
     try {
       const dataUrl = await fileToBackground(chosen);
-      setBackground(card.id, dataUrl);
+      void setBackground(card.id, dataUrl);
       setBackgrounds((current) => ({ ...current, [card.id]: dataUrl }));
     } catch {
       // Ignore unreadable images; the card keeps its current art.
@@ -166,7 +169,7 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   }, []);
 
   const clearBackground = useCallback((card: LibraryCard) => {
-    setBackground(card.id, null);
+    void setBackground(card.id, null);
     setBackgrounds((current) => ({ ...current, [card.id]: null }));
   }, []);
 
@@ -402,10 +405,11 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
                       {setupStatus?.message || "Local song processing needs to be installed."}
                     </p>
                     <p className="uploadFootnote">
-                      This installs the Python audio tools and downloads about 249 MiB of
-                      third-party separation models directly to this computer. Models,
-                      songs, and recordings stay local. Model availability does not grant
-                      rights to use copyrighted material.
+                      This installs the Python audio tools and downloads third-party
+                      separation models directly to this computer: about 1.7 GiB on Apple
+                      silicon Macs and NVIDIA systems, which use the higher-quality models,
+                      or about 250 MiB elsewhere. Models, songs, and recordings stay local.
+                      Model availability does not grant rights to use copyrighted material.
                     </p>
                     {setupStatus?.error && <p className="uploadError">{setupStatus.error}</p>}
                     <div className="uploadButtons">

@@ -32,13 +32,36 @@ to credit UVR and its developers.
 
 Credits named by Audio Separator include Anjok07, DilanBoskan, Kuielab,
 Woosung Choi, KimberleyJSN, Hv, and zhzhongshi. Sona does not commit the model
-weights to Git. `npm run pipeline:setup` downloads the selected public UVR
-model assets from their canonical release URLs and verifies their exact sizes
-and SHA-256 hashes before use.
+weights to Git. `npm run pipeline:setup` downloads the selected model assets
+from their release URLs and verifies their exact sizes and SHA-256 hashes
+before use.
 
-The currently selected assets are `Kim_Inst.onnx`, `Kim_Vocal_2.onnx`, and
-`5_HP-Karaoke-UVR.pth`. They are neither embedded in hosted builds nor served
-by Sona's local companion. Installation is a separate, explicit local action.
+Sona selects one of two model sets for the machine it is installed on and
+downloads only that set.
+
+The `compact` set is `Kim_Inst.onnx`, `Kim_Vocal_2.onnx`, and
+`5_HP-Karaoke-UVR.pth`, from the UVR public model repository above.
+
+The `roformer` set is two Mel-Band RoFormer checkpoints, each with its
+configuration file, downloaded from the Audio Separator project's
+`model-configs` release:
+
+- `vocals_mel_band_roformer.ckpt` by Kimberley Jensen. Her published
+  repository (https://huggingface.co/KimberleyJSN/melbandroformer) declares the
+  MIT License. Sona pins the release file by hash and has not independently
+  confirmed that it is byte-identical to the file in that repository.
+- `mel_band_roformer_karaoke_gabox.ckpt` by Gabox
+  (https://huggingface.co/GaboxR67/MelBandRoformers). That repository declares
+  no license, so no permission beyond what its author has stated publicly
+  should be assumed.
+
+The Mel-Band RoFormer architecture is described in Wang et al., "Mel-Band
+RoFormer for Music Source Separation" (2023); Audio Separator's implementation
+derives from the MIT-licensed BS-RoFormer project
+(https://github.com/lucidrains/BS-RoFormer).
+
+No model asset is embedded in hosted builds or served by Sona's local
+companion. Installation is a separate, explicit local action.
 
 The public availability of a model asset is not itself a grant of additional
 rights, and the MIT license on inference code does not necessarily determine

@@ -11,7 +11,7 @@ import {
   ACCELERATED_ONNX_PROVIDERS,
   selectInferenceBackend,
 } from "./select-inference-backend.mjs";
-import { ensureModelAssets } from "./model-assets.mjs";
+import { ensureModelAssets, selectedSeparatorProfile } from "./model-assets.mjs";
 import {
   clearPipelineReady,
   markPipelineReady,
@@ -157,7 +157,9 @@ export async function setupPipeline() {
     run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", "pip"]);
     run(VENV_PYTHON, ["-m", "pip", "install", "-r", "requirements-pipeline.txt"]);
     installInferenceBackend();
-    await ensureModelAssets();
+    // Decided after the Python environment exists: the choice depends on
+    // whether the installed Torch can use this machine's accelerator.
+    await ensureModelAssets(selectedSeparatorProfile(VENV_PYTHON));
     run(VENV_PYTHON, ["-c", "from work.process_song import validate_models; validate_models(); print('Pipeline models verified.')"]);
     run(VENV_PYTHON, [
       "-c",

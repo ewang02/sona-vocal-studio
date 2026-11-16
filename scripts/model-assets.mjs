@@ -2,6 +2,7 @@
 
 /** Download the public separator weights without committing them to Git. */
 
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   createReadStream,
@@ -26,27 +27,73 @@ export const MODEL_DIRECTORY = join(
 );
 export const MODEL_MANIFEST_PATH = join(MODEL_DIRECTORY, "model-assets.json");
 
+/**
+ * The manifest lists one set of files per separator profile. Only the
+ * profile this machine will run is downloaded.
+ */
 export function readModelManifest(path = MODEL_MANIFEST_PATH) {
   const manifest = JSON.parse(readFileSync(path, "utf8"));
-  if (manifest.version !== 1 || !Array.isArray(manifest.assets)) {
+  const profiles = manifest.profiles;
+  if (
+    manifest.version !== 2 ||
+    !profiles ||
+    typeof profiles !== "object" ||
+    Object.keys(profiles).length === 0
+  ) {
     throw new Error("Unsupported separator model manifest.");
   }
-  for (const asset of manifest.assets) {
-    if (
-      typeof asset.filename !== "string" ||
-      !/^[A-Za-z0-9_.-]+$/.test(asset.filename) ||
-      asset.filename === "." ||
-      asset.filename === ".." ||
-      typeof asset.url !== "string" ||
-      !asset.url.startsWith("https://") ||
-      !Number.isSafeInteger(asset.size) ||
-      asset.size <= 0 ||
-      !/^[a-f0-9]{64}$/.test(asset.sha256)
-    ) {
-      throw new Error(`Invalid separator model manifest entry: ${asset.filename}`);
+  for (const [profile, entry] of Object.entries(profiles)) {
+    if (!/^[a-z0-9-]+$/.test(profile) || !Array.isArray(entry?.assets) || !entry.assets.length) {
+      throw new Error(`Invalid separator model profile: ${profile}`);
+    }
+    for (const asset of entry.assets) {
+      if (
+        typeof asset.filename !== "string" ||
+        !/^[A-Za-z0-9_.-]+$/.test(asset.filename) ||
+        asset.filename === "." ||
+        asset.filename === ".." ||
+        typeof asset.url !== "string" ||
+        !asset.url.startsWith("https://") ||
+        !Number.isSafeInteger(asset.size) ||
+        asset.size <= 0 ||
+        !/^[a-f0-9]{64}$/.test(asset.sha256)
+      ) {
+        throw new Error(`Invalid separator model manifest entry: ${asset.filename}`);
+      }
     }
   }
   return manifest;
+}
+
+export function profileAssets(manifest, profile) {
+  const entry = manifest.profiles[profile];
+  if (!entry) {
+    throw new Error(
+      `Unknown separator profile ${JSON.stringify(profile)}; ` +
+      `choose from ${Object.keys(manifest.profiles).join(", ")}.`,
+    );
+  }
+  return entry.assets;
+}
+
+/**
+ * Ask the pipeline's own Python which model set this machine uses, so setup
+ * downloads exactly what song processing will later require. The choice
+ * depends on the installed Torch build and the SONA_SEPARATOR override.
+ */
+export function selectedSeparatorProfile(python, root = ROOT) {
+  const result = spawnSync(
+    python,
+    ["-c", "from work.hardware_acceleration import separator_profile; print(separator_profile())"],
+    { cwd: root, encoding: "utf8", windowsHide: true },
+  );
+  const profile = result.status === 0 ? result.stdout.trim().split(/\r?\n/).pop() : "";
+  if (!profile) {
+    throw new Error(
+      `Could not determine the separator profile: ${(result.stderr || "").trim() || "no output"}`,
+    );
+  }
+  return profile;
 }
 
 export async function sha256File(path) {
@@ -120,9 +167,14 @@ async function downloadModelAsset(asset, directory = MODEL_DIRECTORY) {
   console.log(`[pipeline-setup] verified ${asset.filename}`);
 }
 
-export async function ensureModelAssets(directory = MODEL_DIRECTORY) {
-  const manifest = readModelManifest();
-  for (const asset of manifest.assets) {
+export async function ensureModelAssets(profile, directory = MODEL_DIRECTORY) {
+  const assets = profileAssets(readModelManifest(), profile);
+  const total = assets.reduce((sum, asset) => sum + asset.size, 0);
+  console.log(
+    `[pipeline-setup] separation models: ${profile} profile ` +
+    `(${(total / 1024 / 1024).toFixed(0)} MiB in ${assets.length} files)`,
+  );
+  for (const asset of assets) {
     if (await verifyModelAsset(asset, directory)) {
       console.log(`[pipeline-setup] ${asset.filename} is present and verified.`);
       continue;
@@ -136,7 +188,11 @@ const invokedPath = process.argv[1]
   : "";
 if (invokedPath === import.meta.url) {
   try {
-    await ensureModelAssets();
+    const python =
+      process.platform === "win32"
+        ? join(ROOT, ".venv", "Scripts", "python.exe")
+        : join(ROOT, ".venv", "bin", "python");
+    await ensureModelAssets(process.argv[2] || selectedSeparatorProfile(python));
   } catch (error) {
     console.error(
       `[model-assets] ${error instanceof Error ? error.message : error}`,

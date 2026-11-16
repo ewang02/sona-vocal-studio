@@ -93,6 +93,12 @@ export function hzToMidi(hz: number): number {
   return Number.isFinite(hz) && hz > 0 ? 69 + 12 * Math.log2(hz / 440) : Number.NaN;
 }
 
+/** Move `midi` by whole octaves to land within six semitones of `reference`. */
+export function foldToOctave(midi: number, reference: number): number {
+  if (!Number.isFinite(midi) || !Number.isFinite(reference)) return midi;
+  return midi - 12 * Math.round((midi - reference) / 12);
+}
+
 /** Seconds → "m:ss", clamped at zero. Shared by the player and the library. */
 export function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
@@ -176,6 +182,13 @@ export function classifyVoiceRange(lowMidi: number, highMidi: number): VoiceFit 
   };
 }
 
+/**
+ * Frames by which the adaptive filter's output trails its newest input: the
+ * 5-frame median reports the middle sample. Multiply by the detector's hop to
+ * get seconds.
+ */
+export const ADAPTIVE_FILTER_LAG_FRAMES = 2;
+
 export function createAdaptivePitchFilter(): AdaptivePitchFilter {
   // The clarity floor must be able to fall as well as rise. Learning it from
   // frames the gate already accepted is a ratchet: the percentile of a set
@@ -207,6 +220,16 @@ export function createAdaptivePitchFilter(): AdaptivePitchFilter {
   // Upward movement must remain possible so an onset initially detected one
   // octave low can recover quickly.
   const UPWARD_OCTAVE_FOLD_LIMIT = 3;
+  // ...with one exception. If a phrase locks an octave HIGH at its onset, the
+  // true pitch then reads as a downward flip and would be folded up for the
+  // rest of the vowel. The singer's own recent register settles it: a low
+  // reading that has persisted and sits clearly nearer to where they have
+  // been singing is the real note, and the lock was the error.
+  const DOWNWARD_OCTAVE_CONFIRM_FRAMES = 12;
+  const REGISTER_HISTORY = 600;
+  const REGISTER_MIN_FRAMES = 90;
+  const REGISTER_REFRESH_FRAMES = 15;
+  const REGISTER_MARGIN = 3;
   // Adaptive EMA over the median output: near-stationary wobble is damped,
   // larger moves pass through at full speed (alpha reaches 1), so glides and
   // onsets keep their timing.
@@ -222,6 +245,10 @@ export function createAdaptivePitchFilter(): AdaptivePitchFilter {
   let stableMidi: number | null = null;
   let emaMidi: number | null = null;
   let octaveFoldStreak = 0;
+  let downwardFoldStreak = 0;
+  let register: number[] = [];
+  let registerMedian: number | null = null;
+  let registerAge = 0;
   let lastAcceptedTime: number | null = null;
   let lastFrameTime: number | null = null;
   let frameCount = 0;
@@ -236,10 +263,30 @@ export function createAdaptivePitchFilter(): AdaptivePitchFilter {
     stableMidi = null;
     emaMidi = null;
     octaveFoldStreak = 0;
+    downwardFoldStreak = 0;
+    register = [];
+    registerMedian = null;
+    registerAge = 0;
     lastAcceptedTime = null;
     lastFrameTime = null;
     frameCount = 0;
   };
+
+  const rememberRegister = (midi: number): void => {
+    register.push(midi);
+    if (register.length > REGISTER_HISTORY) register.shift();
+    registerAge += 1;
+    if (register.length >= REGISTER_MIN_FRAMES && registerAge >= REGISTER_REFRESH_FRAMES) {
+      registerMedian = median(register);
+      registerAge = 0;
+    }
+  };
+
+  // True when the singer's recent register says the lower octave is the real
+  // note and the currently held pitch is the outlier.
+  const registerPrefers = (candidate: number, held: number): boolean =>
+    registerMedian !== null &&
+    Math.abs(candidate - registerMedian) + REGISTER_MARGIN < Math.abs(held - registerMedian);
 
   const result = (midi: number | null, bridged: boolean): FilteredPitchFrame => ({
     midi,
@@ -298,6 +345,7 @@ export function createAdaptivePitchFilter(): AdaptivePitchFilter {
     if (!voiced) {
       pendingJump = [];
       octaveFoldStreak = 0;
+      downwardFoldStreak = 0;
       const gap =
         lastAcceptedTime === null ? Number.POSITIVE_INFINITY : timeMs - lastAcceptedTime;
       if (stableMidi !== null && gap >= 0 && gap <= MAX_BRIDGE_MS) {
@@ -317,18 +365,31 @@ export function createAdaptivePitchFilter(): AdaptivePitchFilter {
       const jump = rawMidi - stableMidi;
       const octaves = Math.round(jump / 12);
       if (octaves !== 0 && Math.abs(jump - octaves * 12) <= OCTAVE_TOLERANCE) {
-        if (octaves < 0 || octaveFoldStreak < UPWARD_OCTAVE_FOLD_LIMIT) {
+        let fold: boolean;
+        if (octaves < 0) {
+          downwardFoldStreak += 1;
+          fold = !(
+            downwardFoldStreak > DOWNWARD_OCTAVE_CONFIRM_FRAMES &&
+            registerPrefers(rawMidi, stableMidi)
+          );
+        } else {
+          downwardFoldStreak = 0;
+          fold = octaveFoldStreak < UPWARD_OCTAVE_FOLD_LIMIT;
+        }
+        if (fold) {
           effectiveMidi = rawMidi - octaves * 12;
           octaveFoldStreak = octaves > 0 ? octaveFoldStreak + 1 : 0;
         }
       } else if (Math.abs(jump) > JUMP_SEMITONES) {
-        // Leave the streak alone: a still-jumping pitch past the fold limit
+        // Leave the streaks alone: a still-jumping pitch past the fold limit
         // must stay unfolded so the confirmer can accept the leap.
       } else {
         octaveFoldStreak = 0;
+        downwardFoldStreak = 0;
       }
     } else {
       octaveFoldStreak = 0;
+      downwardFoldStreak = 0;
     }
 
     if (stableMidi !== null && Math.abs(effectiveMidi - stableMidi) > JUMP_SEMITONES) {
@@ -343,6 +404,7 @@ export function createAdaptivePitchFilter(): AdaptivePitchFilter {
       midiWindow = pendingJump.slice(-MEDIAN_WINDOW);
       pendingJump = [];
       octaveFoldStreak = 0;
+      downwardFoldStreak = 0;
       stableMidi = median(midiWindow);
       // A confirmed jump lands instantly; easing across it would draw a swoop
       // the singer never sang.
@@ -362,6 +424,7 @@ export function createAdaptivePitchFilter(): AdaptivePitchFilter {
       const alpha = clamp(EMA_BASE_ALPHA + Math.abs(delta) * EMA_ALPHA_PER_ST, EMA_BASE_ALPHA, 1);
       emaMidi += alpha * delta;
     }
+    rememberRegister(stableMidi);
     lastAcceptedTime = timeMs;
     return result(emaMidi, false);
   };

@@ -141,6 +141,9 @@ function runJob(job) {
       job.uploadPath,
       "--output-dir",
       library.libraryRoot,
+      // Every upload gets a fresh id, so the four full-length WAV stems a
+      // song leaves behind (about 190 MB) would never be reused.
+      ...(process.env.SONA_KEEP_INTERMEDIATES === "1" ? [] : ["--clean-intermediates"]),
     ], {
       cwd: ROOT,
       env: process.env,

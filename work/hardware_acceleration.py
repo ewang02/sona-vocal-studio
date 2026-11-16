@@ -126,6 +126,31 @@ def torch_device_name(torch_module=None) -> str:
     return "cpu"
 
 
+# Two interchangeable sets of separation models. "roformer" is the higher
+# quality pair and runs on Torch; "compact" is the smaller ONNX/VR trio, whose
+# vocal and instrumental models also run on DirectML, CoreML and plain CPU at
+# a usable speed. Roformers on CPU are several times slower than real time, so
+# they are chosen automatically only where Torch itself has an accelerator.
+SEPARATOR_PROFILES = ("roformer", "compact")
+ROFORMER_TORCH_DEVICES = frozenset({"cuda", "mps"})
+
+
+def separator_profile(torch_module=None, requested: str | None = None) -> str:
+    """Return the model set to use, honoring the SONA_SEPARATOR override."""
+    value = requested if requested is not None else os.getenv("SONA_SEPARATOR", "auto")
+    selected = value.strip().lower() or "auto"
+    if selected in SEPARATOR_PROFILES:
+        return selected
+    if selected != "auto":
+        choices = ", ".join(("auto", *SEPARATOR_PROFILES))
+        raise ValueError(f"Unknown SONA_SEPARATOR={selected!r}; choose from {choices}")
+    return (
+        "roformer"
+        if torch_device_name(torch_module) in ROFORMER_TORCH_DEVICES
+        else "compact"
+    )
+
+
 def inference_hardware() -> dict[str, object]:
     """Serializable hardware provenance for stage caches and diagnostics."""
     import onnxruntime as ort
@@ -143,4 +168,7 @@ def inference_hardware() -> dict[str, object]:
         "onnxAvailableProviders": available,
         "onnxSelectedProviders": onnx_provider_chain(available),
         "torchDevice": torch_device,
+        "separatorProfile": (
+            separator_profile() if torch_device != "unavailable" else "compact"
+        ),
     }

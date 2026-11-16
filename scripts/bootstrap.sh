@@ -234,7 +234,7 @@ npm install
 
 if [ "$INSTALL_PIPELINE" -eq 1 ]; then
   step "Setting up local song processing"
-  note "this downloads PyTorch and ~249 MiB of separation models; it can take several minutes"
+  note "this downloads PyTorch and the separation models (~1.7 GiB with GPU acceleration, ~250 MiB otherwise); it can take several minutes"
   PYTHON="$PYTHON_BIN" npm run pipeline:setup
 fi
 

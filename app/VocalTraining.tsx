@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { hzToMidi, midiToName, type VoiceLabel } from "./pitch-utils";
+import { startPitchTracker, type PitchTracker, type TrackedPitch } from "./pitch-tracker";
+import { midiToName, type VoiceLabel } from "./pitch-utils";
 import {
   exercisesForModule,
   TRAINING_EXERCISES,
@@ -87,6 +88,28 @@ const PREP_SECONDS = 3.2;
 const PLAYHEAD_FRACTION = 2.6 / 7;
 const SCROLL_PIXELS_PER_SECOND = 92;
 const VOICE_TYPE_KEY = "sona.training.voiceType.v1";
+// Shared with the studio: the music is playing through speakers.
+const SPEAKERS_STORAGE_KEY = "sona.usingSpeakers";
+// The page repaints the live marker and meters at this rate; pitch frames
+// arrive about three times as often and are scored individually.
+const LIVE_UI_INTERVAL_MS = 50;
+const RMS_HISTORY_FRAMES = 80;
+
+/**
+ * Per-profile pitch gate. "standard" uses the shared adaptive filter. The
+ * others read the raw detector: lip trills and very quiet singing need a
+ * looser clarity floor than the adaptive filter allows, and agility work
+ * needs every frame unsmoothed. `medianFrames` is the smoothing window, whose
+ * middle sample trails the newest by (medianFrames - 1) / 2 frames.
+ */
+const PROFILE_GATES: Record<TrackingProfile, { clarity: number; medianFrames: number } | null> = {
+  standard: null,
+  guided: null,
+  unvoiced: null,
+  sovt: { clarity: 0.28, medianFrames: 7 },
+  quiet: { clarity: 0.28, medianFrames: 7 },
+  agility: { clarity: 0.42, medianFrames: 1 },
+};
 
 const VOICE_PROFILES: ReadonlyArray<{ label: VoiceLabel; low: number; high: number }> = [
   { label: "Bass", low: 40, high: 64 },
@@ -253,11 +276,18 @@ function ExercisePlayer({ exercise, onBack, onComplete }: { exercise: TrainingEx
   const [rmsHistory, setRmsHistory] = useState<number[]>([]);
   const [recordingUrl, setRecordingUrl] = useState("");
   const audioContextRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const nodeRef = useRef<AudioWorkletNode | null>(null);
+  const trackerRef = useRef<PitchTracker | null>(null);
+  const micGenerationRef = useRef(0);
   const filterHistoryRef = useRef<number[]>([]);
+  const rmsHistoryRef = useRef<number[]>([]);
   const samplesRef = useRef<Array<MicFrame & { target: number | null }>>([]);
-  const startRef = useRef(0);
+  // AudioContext time at which the session's first beat is scheduled, and
+  // whether a take is in progress. The pitch callback reads these directly.
+  const sessionStartRef = useRef(0);
+  const runningRef = useRef(false);
+  const sessionDurationRef = useRef(0);
+  const targetAtRef = useRef<(time: number) => number | null>(() => null);
+  const sessionAtRef = useRef<(time: number) => { preparing: boolean }>(() => ({ preparing: true }));
   const timerRef = useRef<number | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -310,14 +340,12 @@ function ExercisePlayer({ exercise, onBack, onComplete }: { exercise: TrainingEx
   }, [risePerRound, roundDuration, sessionDuration, targetMidi]);
 
   const stopMic = useCallback(() => {
-    nodeRef.current?.disconnect();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    nodeRef.current = null;
-    streamRef.current = null;
+    micGenerationRef.current += 1;
+    trackerRef.current?.stop();
+    trackerRef.current = null;
     setMicState("off");
   }, []);
 
-  useEffect(() => { liveRef.current = live; }, [live]);
   useEffect(() => { recordingUrlRef.current = recordingUrl; }, [recordingUrl]);
   useEffect(() => {
     const restore = window.setTimeout(() => {
@@ -331,11 +359,32 @@ function ExercisePlayer({ exercise, onBack, onComplete }: { exercise: TrainingEx
   useEffect(() => () => {
     if (timerRef.current) window.clearInterval(timerRef.current);
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
-    nodeRef.current?.disconnect();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
+    micGenerationRef.current += 1;
+    trackerRef.current?.stop();
+    trackerRef.current = null;
     scheduledSourcesRef.current.forEach((source) => { try { source.stop(); } catch {} });
     if (recordingUrlRef.current) URL.revokeObjectURL(recordingUrlRef.current);
+    // Browsers cap the number of live AudioContexts; release this one.
+    void audioContextRef.current?.close();
+    audioContextRef.current = null;
   }, []);
+
+  // Repaint the live marker and meters at a steady, modest rate while the
+  // microphone is on, instead of re-rendering on every pitch frame.
+  useEffect(() => {
+    if (micState !== "on") return;
+    let shownAt = -1;
+    const timer = window.setInterval(() => {
+      const latest = liveRef.current;
+      if (latest.at === shownAt) return;
+      shownAt = latest.at;
+      setLive(latest);
+      if (exercise.kind === "breath" || exercise.profile === "unvoiced") {
+        setRmsHistory([...rmsHistoryRef.current]);
+      }
+    }, LIVE_UI_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [exercise.kind, exercise.profile, micState]);
 
   const ensureContext = useCallback(async () => {
     let context = audioContextRef.current;
@@ -347,50 +396,86 @@ function ExercisePlayer({ exercise, onBack, onComplete }: { exercise: TrainingEx
     return context;
   }, []);
 
+  // What the singer hears trails the context clock by the output chain.
+  const outputLatency = useCallback(() => {
+    const context = audioContextRef.current;
+    if (!context) return 0;
+    const output = Number.isFinite(context.outputLatency) ? context.outputLatency : 0;
+    return (context.baseLatency || 0) + output;
+  }, []);
+
+  const handlePitch = useCallback((pitch: TrackedPitch) => {
+    const context = audioContextRef.current;
+    const tracker = trackerRef.current;
+    if (!context || !tracker) return;
+    const gate = PROFILE_GATES[exercise.profile];
+    let midi: number | null;
+    let lagFrames: number;
+    if (gate) {
+      midi = pitch.rawMidi !== null && pitch.clarity >= gate.clarity ? pitch.rawMidi : null;
+      lagFrames = 0;
+      if (midi !== null && gate.medianFrames > 1) {
+        const history = filterHistoryRef.current;
+        history.push(midi);
+        if (history.length > gate.medianFrames) history.shift();
+        midi = [...history].sort((a, b) => a - b)[Math.floor(history.length / 2)];
+        lagFrames = (gate.medianFrames - 1) / 2;
+      }
+    } else {
+      midi = pitch.midi;
+      lagFrames = tracker.filterLag() / tracker.hopSeconds();
+    }
+    const frame: MicFrame = { midi, rms: pitch.rms, clarity: pitch.clarity, at: performance.now() };
+    liveRef.current = frame;
+    const history = rmsHistoryRef.current;
+    history.push(pitch.rms);
+    if (history.length > RMS_HISTORY_FRAMES) history.shift();
+
+    if (!runningRef.current) return;
+    // Score the frame against the note the singer was hearing when they made
+    // the sound, not the note sounding now: the reading is older than "now"
+    // by capture, analysis and smoothing, and what they heard was older still
+    // by the output delay. Without this every note change scores as a miss.
+    const filterLagSeconds = lagFrames * tracker.hopSeconds();
+    const sungAt =
+      pitch.sampleTime !== null
+        ? pitch.sampleTime - filterLagSeconds - tracker.captureLatency
+        : context.currentTime - (tracker.fallbackAge() - tracker.filterLag() + filterLagSeconds);
+    const position = sungAt - outputLatency() - sessionStartRef.current;
+    if (position < 0 || position >= sessionDurationRef.current) return;
+    if (sessionAtRef.current(position).preparing) return;
+    samplesRef.current.push({ ...frame, target: targetAtRef.current(position) });
+  }, [exercise.profile, outputLatency]);
+
   const startMic = useCallback(async () => {
     if (micState === "on") { stopMic(); return; }
+    const generation = ++micGenerationRef.current;
     setMicState("starting");
     setMicError("");
     try {
       const context = await ensureContext();
-      await context.audioWorklet.addModule("/pitch-worklet.js?v=training-1");
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false, channelCount:1 } });
-      const source = context.createMediaStreamSource(stream);
-      const node = new AudioWorkletNode(context, "sona-pitch-processor", { numberOfInputs:1, numberOfOutputs:1, outputChannelCount:[1] });
-      const silent = context.createGain();
-      silent.gain.value = 0;
-      source.connect(node).connect(silent).connect(context.destination);
-      streamRef.current = stream;
-      nodeRef.current = node;
-      node.port.onmessage = (event: MessageEvent) => {
-        const data = event.data as { type: string; f0?: number | null; clarity?: number; rms?: number };
-        if (data.type !== "pitch") return;
-        const raw = data.f0 ? hzToMidi(data.f0) : null;
-        const clarity = data.clarity ?? 0;
-        const rms = data.rms ?? 0;
-        const threshold = exercise.profile === "sovt" || exercise.profile === "quiet" ? .28 : exercise.profile === "agility" ? .42 : .36;
-        let midi = raw !== null && clarity >= threshold ? raw : null;
-        if (midi !== null && exercise.profile !== "agility") {
-          const history = filterHistoryRef.current;
-          history.push(midi);
-          const windowSize = exercise.profile === "sovt" || exercise.profile === "quiet" ? 7 : 3;
-          if (history.length > windowSize) history.shift();
-          midi = [...history].sort((a,b) => a-b)[Math.floor(history.length / 2)];
-        }
-        setLive({ midi, rms, clarity, at: performance.now() });
-        if (exercise.kind === "breath" || exercise.profile === "unvoiced") {
-          setRmsHistory((prev) => {
-            const next = [...prev, rms];
-            return next.length > 80 ? next.slice(-80) : next;
-          });
-        }
-      };
+      let speakers = false;
+      try { speakers = localStorage.getItem(SPEAKERS_STORAGE_KEY) === "1"; } catch {}
+      const tracker = await startPitchTracker(context, {
+        speakers,
+        onPitch: handlePitch,
+        onEnded: () => {
+          if (generation !== micGenerationRef.current) return;
+          stopMic();
+          setMicError("Microphone disconnected.");
+        },
+      });
+      if (generation !== micGenerationRef.current) { tracker.stop(); return; }
+      trackerRef.current = tracker;
+      filterHistoryRef.current = [];
+      rmsHistoryRef.current = [];
       setMicState("on");
     } catch (error) {
+      if (generation !== micGenerationRef.current) return;
       setMicError(error instanceof Error ? error.message : "Microphone could not start.");
       setMicState("off");
     }
-  }, [ensureContext, exercise.kind, exercise.profile, micState, stopMic]);
+  }, [ensureContext, handlePitch, micState, stopMic]);
 
   const targetAt = useCallback((time: number) => {
     if (!exercise.pattern.length) return null;
@@ -404,9 +489,16 @@ function ExercisePlayer({ exercise, onBack, onComplete }: { exercise: TrainingEx
     return null;
   }, [exercise.pattern, noteDurations, secondsPerBeat, sessionAt]);
 
+  useEffect(() => {
+    targetAtRef.current = targetAt;
+    sessionAtRef.current = sessionAt;
+    sessionDurationRef.current = sessionDuration;
+  }, [sessionAt, sessionDuration, targetAt]);
+
   const finish = useCallback((completed = true) => {
     if (timerRef.current) window.clearInterval(timerRef.current);
     timerRef.current = null;
+    runningRef.current = false;
     setRunning(false);
     scheduledSourcesRef.current.forEach((source) => { try { source.stop(); } catch {} });
     scheduledSourcesRef.current = [];
@@ -448,11 +540,13 @@ function ExercisePlayer({ exercise, onBack, onComplete }: { exercise: TrainingEx
     setElapsed(0);
     samplesRef.current = [];
     setRmsHistory([]);
+    rmsHistoryRef.current = [];
     filterHistoryRef.current = [];
+    trackerRef.current?.resetFilter();
     if (recordingUrl) { URL.revokeObjectURL(recordingUrl); setRecordingUrl(""); }
-    if (streamRef.current && typeof MediaRecorder !== "undefined") {
+    if (trackerRef.current && typeof MediaRecorder !== "undefined") {
       chunksRef.current = [];
-      const recorder = new MediaRecorder(streamRef.current);
+      const recorder = new MediaRecorder(trackerRef.current.stream);
       recorderRef.current = recorder;
       recorder.ondataavailable = (event) => event.data.size && chunksRef.current.push(event.data);
       recorder.onstop = () => setRecordingUrl(URL.createObjectURL(new Blob(chunksRef.current, { type: recorder.mimeType })));
@@ -480,19 +574,18 @@ function ExercisePlayer({ exercise, onBack, onComplete }: { exercise: TrainingEx
         scheduledSourcesRef.current.push(...playPianoNote(context, roundPitch, now + activeStart, 1.1, .145));
       }
     }
-    startRef.current = performance.now();
+    // The piano is scheduled on the audio clock, so the session runs on it
+    // too: the display shows what is audible now, and each pitch frame is
+    // scored against the same clock in handlePitch.
+    sessionStartRef.current = now;
+    runningRef.current = true;
     setRunning(true);
     timerRef.current = window.setInterval(() => {
-      const value = (performance.now() - startRef.current) / 1000;
+      const value = Math.max(0, context.currentTime - sessionStartRef.current - outputLatency());
       setElapsed(Math.min(value, sessionDuration));
-      const position = sessionAt(value);
-      if (!position.preparing) {
-        const target = targetAt(value);
-        samplesRef.current.push({ ...liveRef.current, target });
-      }
       if (value >= sessionDuration) finish(true);
     }, 70);
-  }, [ensureContext, exercise.kind, exercise.pattern, finish, noteDurations, recordingUrl, risePerRound, roundDuration, running, secondsPerBeat, sessionAt, sessionDuration, targetAt, targetMidi]);
+  }, [ensureContext, exercise.kind, exercise.pattern, finish, noteDurations, outputLatency, recordingUrl, risePerRound, roundDuration, running, secondsPerBeat, sessionDuration, targetMidi]);
 
   const currentTarget = targetAt(elapsed);
   const cents = live.midi !== null && currentTarget !== null ? Math.round((live.midi - currentTarget) * 100) : null;

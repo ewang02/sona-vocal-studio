@@ -7,7 +7,7 @@ import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const BLOCKED_EXTENSIONS = new Set([".mp3", ".wav", ".onnx", ".pth"]);
+const BLOCKED_EXTENSIONS = new Set([".mp3", ".wav", ".onnx", ".pth", ".ckpt"]);
 
 function walk(directory) {
   if (!existsSync(directory)) return [];

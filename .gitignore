@@ -60,5 +60,7 @@ __pycache__/
 !/contour_out/models/audio-separator/model-assets.json
 /contour_out/models/audio-separator/*.onnx
 /contour_out/models/audio-separator/*.pth
+/contour_out/models/audio-separator/*.ckpt
+/contour_out/models/audio-separator/*.yaml
 /*.mp3
 /*.wav

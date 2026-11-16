@@ -48,6 +48,7 @@ test("ships no songs, contours, repair sources, or model weights", async () => {
 
   await Promise.all([
     access(new URL("public/pitch-worklet.js", root)),
+    access(new URL("public/recorder-worklet.js", root)),
     access(new URL("public/soundtouch-processor.js", root)),
     access(new URL("public/og.png", root)),
   ]);
@@ -61,10 +62,11 @@ test("ships no songs, contours, repair sources, or model weights", async () => {
 });
 
 test("ships the three-mode editor, practice, and recording behavior", async () => {
-  const [studio, songs, pitchUtils, worklet, packageJson] = await Promise.all([
+  const [studio, songs, pitchUtils, tracker, worklet, packageJson] = await Promise.all([
     read("app/StudioPlayer.tsx"),
     read("app/songs.ts"),
     read("app/pitch-utils.ts"),
+    read("app/pitch-tracker.ts"),
     read("public/pitch-worklet.js"),
     read("package.json"),
   ]);
@@ -76,14 +78,20 @@ test("ships the three-mode editor, practice, and recording behavior", async () =
   assert.match(studio, /saveEditedDefault/);
   assert.match(studio, /restoreOriginalContour/);
 
-  assert.match(studio, /createAdaptivePitchFilter/);
-  assert.match(studio, /adaptiveFilterRef\.current\.process/);
+  // The studio and the training exercises share one microphone tracker,
+  // which owns the adaptive filter.
+  assert.match(studio, /startPitchTracker/);
+  assert.match(tracker, /createAdaptivePitchFilter/);
+  assert.match(tracker, /filter\.process/);
   assert.doesNotMatch(studio, /autoFilter|effectiveLaneMode|autoNotes|manualNotes/);
   assert.doesNotMatch(songs, /autoNotes|manualNotes|-auto\.json|-ref\.json/);
 
   assert.match(studio, /guideVocalsRef\.current = true/);
-  assert.match(studio, /studioMode !== "recording" && guideVocals/);
+  // Guide vocals switch what is audible; they never reload the transport.
+  assert.match(studio, /audio\.src = song\.instrumental/);
+  assert.doesNotMatch(studio, /audio\.src = [^;]*song\.audio/);
   assert.match(studio, /instrumentCaptureRef/);
+  assert.doesNotMatch(studio, /createScriptProcessor/);
   assert.match(studio, /Raw vocals/);
   assert.match(studio, /Instrumental/);
   assert.match(studio, /Combined mix/);
@@ -100,7 +108,9 @@ test("ships the three-mode editor, practice, and recording behavior", async () =
   assert.match(studio, /livePitchSampleTimeRef/);
   assert.match(studio, /outputLatencyRef/);
   assert.match(studio, /captureLatencyRef/);
-  assert.match(studio, /echoCancellation: false/);
+  // Raw capture by default; the canceller is opt-in for speaker playback.
+  assert.match(tracker, /echoCancellation: speakers \? true : false/);
+  assert.match(studio, /sona\.usingSpeakers/);
   assert.doesNotMatch(studio, /detail\?\.framesBuffered/);
   assert.match(worklet, /analysisLatency/);
   assert.match(worklet, /contextTimeOrigin/);

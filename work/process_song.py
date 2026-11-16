@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""End-to-end pipeline for one uploaded song using the selected Kim models.
+"""End-to-end pipeline for one uploaded song.
 
-The commercial-separator bake-off selected a two-model route:
+Separation uses one of two interchangeable model sets (see
+``hardware_acceleration.separator_profile``):
 
-* ``Kim_Inst.onnx`` supplies the instrumental published to the web app.
+``roformer`` -- the default wherever Torch has an accelerator:
+
+* ``vocals_mel_band_roformer.ckpt`` splits the song once into the broad vocal
+  pitch anchor and, by subtraction, the instrumental published to the web app.
+* ``mel_band_roformer_karaoke_gabox.ckpt`` splits that vocal stem into
+  lead/backing evidence.
+
+``compact`` -- smaller ONNX/VR models that stay fast on DirectML, CoreML and
+plain CPU:
+
+* ``Kim_Inst.onnx`` supplies the instrumental.
 * ``Kim_Vocal_2.onnx`` supplies the broad vocal pitch anchor.
 * ``5_HP-Karaoke-UVR.pth`` splits that vocal stem into lead/backing evidence.
 
@@ -40,11 +51,11 @@ from pathlib import Path
 
 try:  # Support both ``python work/process_song.py`` and test/module imports.
     from .contour_pipeline_config import PRODUCTION_CONFIG
-    from .hardware_acceleration import inference_hardware
+    from .hardware_acceleration import inference_hardware, separator_profile
     from .pipeline_cache import StageCache
 except ImportError:  # pragma: no cover - exercised by the script entry point
     from contour_pipeline_config import PRODUCTION_CONFIG
-    from hardware_acceleration import inference_hardware
+    from hardware_acceleration import inference_hardware, separator_profile
     from pipeline_cache import StageCache
 
 
@@ -57,9 +68,17 @@ KIM_SEPARATOR = ROOT / "work" / "separate_kim_stem.py"
 KIM_INST_MODEL = "Kim_Inst.onnx"
 KIM_VOCAL_MODEL = "Kim_Vocal_2.onnx"
 LEAD_MODEL = "5_HP-Karaoke-UVR.pth"
-MODEL_HASHES = {
-    asset["filename"]: asset["sha256"]
-    for asset in json.loads(MODEL_ASSET_MANIFEST.read_text())["assets"]
+STEM_SEPARATOR = ROOT / "work" / "separate_stems.py"
+ROFORMER_VOCAL_MODEL = "vocals_mel_band_roformer.ckpt"
+ROFORMER_VOCAL_CONFIG = "vocals_mel_band_roformer.yaml"
+ROFORMER_LEAD_MODEL = "mel_band_roformer_karaoke_gabox.ckpt"
+ROFORMER_LEAD_CONFIG = "config_mel_band_roformer_karaoke_gabox.yaml"
+# Weights and their configs, per separator profile, pinned by SHA-256.
+PROFILE_MODEL_HASHES = {
+    profile: {asset["filename"]: asset["sha256"] for asset in entry["assets"]}
+    for profile, entry in json.loads(MODEL_ASSET_MANIFEST.read_text())[
+        "profiles"
+    ].items()
 }
 MODEL_METADATA_HASHES = {
     "download_checks.json": "e3d2e06b67e9f1073d668295bcc76821030bb97359d2583bbd4bed3afbe18264",
@@ -105,9 +124,10 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_models(hash_file=sha256) -> dict[str, str]:
+def validate_models(hash_file=sha256, profile: str | None = None) -> dict[str, str]:
     """Require the exact benchmarked weights before starting a costly run."""
-    pipeline_assets = {**MODEL_HASHES, **MODEL_METADATA_HASHES}
+    model_hashes = PROFILE_MODEL_HASHES[profile or separator_profile()]
+    pipeline_assets = {**model_hashes, **MODEL_METADATA_HASHES}
     missing = [
         filename for filename in pipeline_assets if not (MODEL_DIR / filename).exists()
     ]
@@ -124,7 +144,7 @@ def validate_models(hash_file=sha256) -> dict[str, str]:
                 f"separator asset hash mismatch for {filename}: "
                 f"expected {expected_hash}, got {actual_hash}"
             )
-    return dict(MODEL_HASHES)
+    return dict(model_hashes)
 
 
 def installed_versions(*packages: str) -> dict[str, str]:
@@ -232,11 +252,67 @@ def separate_kim_product(
     return destination
 
 
+def stem_separator_command(
+    python: Path,
+    source: Path,
+    model: str,
+    primary: Path,
+    secondary: Path,
+) -> list[str]:
+    """Build the one-pass Roformer command: a predicted stem and its remainder."""
+    return [
+        str(python),
+        str(STEM_SEPARATOR),
+        str(source),
+        "--model",
+        model,
+        "--model-dir",
+        str(MODEL_DIR),
+        "--primary",
+        str(primary),
+        "--secondary",
+        str(secondary),
+    ]
+
+
+def separate_stem_pair(
+    source: Path,
+    *,
+    model: str,
+    primary: Path,
+    secondary: Path,
+) -> None:
+    """Run one Roformer model; the helper replaces both stems atomically."""
+    if not STEM_SEPARATOR.exists():
+        raise RuntimeError(f"stem separator helper not found: {STEM_SEPARATOR}")
+    run(stem_separator_command(Path(PYTHON), source, model, primary, secondary))
+    for output in (primary, secondary):
+        if not output.is_file():
+            raise RuntimeError(f"stem separator did not produce: {output}")
+
+
+def remove_intermediate_audio(directories: list[Path]) -> int:
+    """Delete regenerable WAV stems; return the number of bytes released."""
+    released = 0
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.wav"):
+            released += path.stat().st_size
+            path.unlink()
+        try:
+            directory.rmdir()
+        except OSError:
+            pass  # Something else lives here; leave it.
+    return released
+
+
 def process(
     song: str,
     mp3: Path,
     *,
     force: bool = False,
+    clean_intermediates: bool = False,
     branch_workers: int = 2,
     kim_batch_size: int = 1,
     lead_vr_batch_size: int = 1,
@@ -271,7 +347,9 @@ def process(
     public_data.mkdir(parents=True, exist_ok=True)
 
     cache = StageCache(ROOT, song, marker)
-    model_hashes = validate_models(cache.file_hash)
+    profile = separator_profile()
+    marker(f"::profile separator={profile}")
+    model_hashes = validate_models(cache.file_hash, profile)
 
     def code_hashes(*relative_paths: str) -> dict[str, str]:
         return cache.code_hashes(
@@ -308,45 +386,44 @@ def process(
     instrumental = separator_dir / "instrumental.wav"
     vocals = separator_dir / "vocals.wav"
     public_instrumental = public_audio / f"{song}-instrumental.mp3"
-    cache.run(
-        "vocal_separation",
-        {
-            "revision": PIPELINE_CACHE_REVISION,
-            "sourceSha256": source_hash,
-            "model": {KIM_VOCAL_MODEL: model_hashes[KIM_VOCAL_MODEL]},
-            "arguments": {
-                "stem": "Vocals",
-                "sampleRate": 44_100,
-                "hopLength": 1024,
-                "segmentSize": 256,
-                "overlap": 0.25,
-                "batchSize": kim_batch_size,
-                "denoise": False,
-            },
-            "environment": separator_environment,
-            "code": code_hashes("work/separate_kim_stem.py"),
-        },
-        [vocals],
-        lambda: separate_kim_product(
-            root_mp3,
-            vocals,
-            model=KIM_VOCAL_MODEL,
-            stem="Vocals",
-            output_name="vocals",
-            batch_size=kim_batch_size,
-        ),
-        force=force,
-    )
-
-    def build_instrumental_branch() -> None:
+    if profile == "roformer":
+        # One pass yields both products: the model predicts the vocals and the
+        # instrumental is the input minus that prediction.
         cache.run(
-            "instrumental_separation",
+            "stem_separation",
             {
                 "revision": PIPELINE_CACHE_REVISION,
                 "sourceSha256": source_hash,
-                "model": {KIM_INST_MODEL: model_hashes[KIM_INST_MODEL]},
+                "model": {
+                    name: model_hashes[name]
+                    for name in (ROFORMER_VOCAL_MODEL, ROFORMER_VOCAL_CONFIG)
+                },
                 "arguments": {
-                    "stem": "Instrumental",
+                    "primary": "vocals",
+                    "secondary": "instrumental",
+                    "sampleRate": 44_100,
+                },
+                "environment": separator_environment,
+                "code": code_hashes("work/separate_stems.py"),
+            },
+            [vocals, instrumental],
+            lambda: separate_stem_pair(
+                root_mp3,
+                model=ROFORMER_VOCAL_MODEL,
+                primary=vocals,
+                secondary=instrumental,
+            ),
+            force=force,
+        )
+    else:
+        cache.run(
+            "vocal_separation",
+            {
+                "revision": PIPELINE_CACHE_REVISION,
+                "sourceSha256": source_hash,
+                "model": {KIM_VOCAL_MODEL: model_hashes[KIM_VOCAL_MODEL]},
+                "arguments": {
+                    "stem": "Vocals",
                     "sampleRate": 44_100,
                     "hopLength": 1024,
                     "segmentSize": 256,
@@ -357,17 +434,49 @@ def process(
                 "environment": separator_environment,
                 "code": code_hashes("work/separate_kim_stem.py"),
             },
-            [instrumental],
+            [vocals],
             lambda: separate_kim_product(
                 root_mp3,
-                instrumental,
-                model=KIM_INST_MODEL,
-                stem="Instrumental",
-                output_name="instrumental",
+                vocals,
+                model=KIM_VOCAL_MODEL,
+                stem="Vocals",
+                output_name="vocals",
                 batch_size=kim_batch_size,
             ),
             force=force,
         )
+
+    def build_instrumental_branch() -> None:
+        if profile != "roformer":
+            cache.run(
+                "instrumental_separation",
+                {
+                    "revision": PIPELINE_CACHE_REVISION,
+                    "sourceSha256": source_hash,
+                    "model": {KIM_INST_MODEL: model_hashes[KIM_INST_MODEL]},
+                    "arguments": {
+                        "stem": "Instrumental",
+                        "sampleRate": 44_100,
+                        "hopLength": 1024,
+                        "segmentSize": 256,
+                        "overlap": 0.25,
+                        "batchSize": kim_batch_size,
+                        "denoise": False,
+                    },
+                    "environment": separator_environment,
+                    "code": code_hashes("work/separate_kim_stem.py"),
+                },
+                [instrumental],
+                lambda: separate_kim_product(
+                    root_mp3,
+                    instrumental,
+                    model=KIM_INST_MODEL,
+                    stem="Instrumental",
+                    output_name="instrumental",
+                    batch_size=kim_batch_size,
+                ),
+                force=force,
+            )
         cache.run(
             "instrumental_encode",
             {
@@ -404,38 +513,66 @@ def process(
     def isolate_lead_vocals() -> None:
         backing_vocals = lead_vocals_dir / "backing.wav"
         try:
-            cache.run(
-                "lead_separation",
-                {
-                    "revision": PIPELINE_CACHE_REVISION,
-                    "sourceSha256": cache.file_hash(vocals),
-                    "model": {LEAD_MODEL: model_hashes[LEAD_MODEL]},
-                    "arguments": {
-                        "vrBatchSize": lead_vr_batch_size,
-                        "vrWindowSize": 512,
-                        "outputFormat": "WAV",
-                        "soundfile": True,
+            if profile == "roformer":
+                cache.run(
+                    "lead_separation",
+                    {
+                        "revision": PIPELINE_CACHE_REVISION,
+                        "sourceSha256": cache.file_hash(vocals),
+                        "model": {
+                            name: model_hashes[name]
+                            for name in (ROFORMER_LEAD_MODEL, ROFORMER_LEAD_CONFIG)
+                        },
+                        "arguments": {
+                            "primary": "lead",
+                            "secondary": "backing",
+                            "sampleRate": 44_100,
+                        },
+                        "environment": separator_environment,
+                        "code": code_hashes("work/separate_stems.py"),
                     },
-                    "environment": separator_environment,
-                    "code": code_hashes("work/separate_lead_vocals.py"),
-                },
-                [lead_vocals, backing_vocals],
-                lambda: run(
-                    [
-                        PYTHON,
-                        "work/separate_lead_vocals.py",
-                        "--song",
-                        song,
-                        "--source",
-                        str(vocals),
-                        "--validated-model-sha256",
-                        model_hashes[LEAD_MODEL],
-                        "--vr-batch-size",
-                        str(lead_vr_batch_size),
-                    ]
-                ),
-                force=force,
-            )
+                    [lead_vocals, backing_vocals],
+                    lambda: separate_stem_pair(
+                        vocals,
+                        model=ROFORMER_LEAD_MODEL,
+                        primary=lead_vocals,
+                        secondary=backing_vocals,
+                    ),
+                    force=force,
+                )
+            else:
+                cache.run(
+                    "lead_separation",
+                    {
+                        "revision": PIPELINE_CACHE_REVISION,
+                        "sourceSha256": cache.file_hash(vocals),
+                        "model": {LEAD_MODEL: model_hashes[LEAD_MODEL]},
+                        "arguments": {
+                            "vrBatchSize": lead_vr_batch_size,
+                            "vrWindowSize": 512,
+                            "outputFormat": "WAV",
+                            "soundfile": True,
+                        },
+                        "environment": separator_environment,
+                        "code": code_hashes("work/separate_lead_vocals.py"),
+                    },
+                    [lead_vocals, backing_vocals],
+                    lambda: run(
+                        [
+                            PYTHON,
+                            "work/separate_lead_vocals.py",
+                            "--song",
+                            song,
+                            "--source",
+                            str(vocals),
+                            "--validated-model-sha256",
+                            model_hashes[LEAD_MODEL],
+                            "--vr-batch-size",
+                            str(lead_vr_batch_size),
+                        ]
+                    ),
+                    force=force,
+                )
             if not lead_vocals.exists():
                 raise RuntimeError(
                     f"lead-vocal separator did not produce: {lead_vocals}"
@@ -693,6 +830,12 @@ def process(
         instrumental_executor.shutdown(wait=True, cancel_futures=False)
 
     duration = ffprobe_duration(public_source)
+    if clean_intermediates:
+        # Each song leaves four full-length WAV stems behind. Nothing reads
+        # them after publication; the small CSV/JSON evidence is kept so a
+        # contour can still be re-exported without separating again.
+        released = remove_intermediate_audio([separator_dir, lead_vocals_dir])
+        marker(f"::cleanup releasedBytes={released}")
     marker(
         f"::timing stage=total seconds={time.perf_counter() - total_started:.3f}"
     )
@@ -718,6 +861,14 @@ def main() -> None:
         help="local library root for audio/ and data/ (default: .sona-data/library)",
     )
     parser.add_argument(
+        "--clean-intermediates",
+        action="store_true",
+        help=(
+            "delete the separated WAV stems once the song is published; "
+            "a later rerun of this song id separates again"
+        ),
+    )
+    parser.add_argument(
         "--branch-workers",
         type=int,
         choices=(1, 2),
@@ -728,13 +879,13 @@ def main() -> None:
         "--kim-batch-size",
         type=int,
         default=1,
-        help="Kim MDX batch size (benchmarked safe default 1)",
+        help="compact profile: Kim MDX batch size (benchmarked safe default 1)",
     )
     parser.add_argument(
         "--lead-vr-batch-size",
         type=int,
         default=1,
-        help="lead-separator VR batch size (benchmarked safe default 1)",
+        help="compact profile: lead-separator VR batch size (benchmarked safe default 1)",
     )
     parser.add_argument(
         "--anchor-batch-size",
@@ -774,6 +925,7 @@ def main() -> None:
             args.song,
             mp3,
             force=args.force,
+            clean_intermediates=args.clean_intermediates,
             branch_workers=args.branch_workers,
             kim_batch_size=args.kim_batch_size,
             lead_vr_batch_size=args.lead_vr_batch_size,

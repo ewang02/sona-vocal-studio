@@ -63,7 +63,9 @@ npm start
 
 That runs the web interface and its loopback-only local companion together.
 Open the printed URL and choose **Add a song**. On first use, Sona offers to
-install the Python tools and download about 249 MiB of separation models;
+install the Python tools and download the separation models: about 1.7 GiB on
+Apple silicon Macs and NVIDIA systems, about 250 MiB elsewhere (see
+[Performance and hardware support](#performance-and-hardware-support));
 downloads are size- and SHA-256-verified. The rest of the app works before that
 optional setup finishes.
 
@@ -102,8 +104,15 @@ Practicing is the default mode. Enable your microphone and press play to see
 your detected pitch against the target contour. Sona shows whether you are on
 pitch and scores voiced sections as you sing.
 
-Turn on **Guide vocals** when you want to hear the original singer. Use **Mic
-timing** if the detected pitch appears slightly ahead of or behind the music.
+Turn on **Guide vocals** when you want to hear the original singer; the song
+keeps its place and your score when you switch. Use **Mic timing** if the
+detected pitch appears slightly ahead of or behind the music. The setting is
+remembered for each microphone and also aligns recorded vocals.
+
+Headphones give the most accurate tracking. If the music plays out loud
+instead, turn on **Using speakers** so the microphone does not score the song
+itself. **Any-octave scoring** gives credit for singing the melody an octave
+above or below the target.
 
 ### Editing
 
@@ -140,8 +149,22 @@ arrow keys skip five seconds.
 
 ## Performance and hardware support
 
-The processing pipeline runs on macOS, Windows, and Linux. It automatically
-selects the fastest available packaged inference backend:
+The processing pipeline runs on macOS, Windows, and Linux. It uses one of two
+sets of separation models, chosen during setup:
+
+| Model set | Chosen automatically on | Download | Models |
+| --- | --- | --- | --- |
+| `roformer` | Apple silicon Macs and NVIDIA CUDA systems | about 1.7 GiB | Mel-Band RoFormer vocal and karaoke models |
+| `compact` | everything else | about 250 MiB | Kim MDX-Net and UVR karaoke models |
+
+The RoFormer models separate vocals more cleanly but run on PyTorch and are
+several times slower than real time without a GPU, so machines that would run
+them on the CPU keep the compact set. Set `SONA_SEPARATOR` to `roformer` or
+`compact` before running setup and the pipeline to choose explicitly; the
+default is `auto`. Only the selected set is downloaded.
+
+Within a model set the pipeline selects the fastest available packaged
+inference backend:
 
 - NVIDIA CUDA on supported NVIDIA systems
 - Core ML or Metal Performance Shaders on macOS
@@ -260,8 +283,9 @@ The main pipeline files are:
 - `server/pipeline-server.mjs` — local upload server and job queue
 - `work/process_song.py` — cached end-to-end orchestration
 - `work/hardware_acceleration.py` — hardware detection and CPU fallback
-- `work/separate_kim_stem.py` — vocal and instrumental separation
-- `work/separate_lead_vocals.py` — lead and backing vocal separation
+- `work/separate_stems.py` — RoFormer separation: one pass per stem pair
+- `work/separate_kim_stem.py` — compact-set vocal and instrumental separation
+- `work/separate_lead_vocals.py` — compact-set lead and backing separation
 - `contour.py` — CREPE and pYIN extraction
 - `work/export_contour.py` — contour correction and browser export
 - `work/contour_pipeline_config.py` — named contour presets
@@ -282,6 +306,11 @@ To process a song directly into the local library after setup:
 
 The pipeline creates missing output directories automatically and can resume
 from its integrity-checked stage cache. Add `--force` to rebuild every stage.
+
+Each song produces four full-length WAV stems (about 190 MB) under
+`contour_out/`. The companion deletes them once a song is published, keeping
+the small pitch evidence; set `SONA_KEEP_INTERMEDIATES=1` to keep them. Running
+`process_song.py` directly keeps them unless you pass `--clean-intermediates`.
 
 ### Validate a change
 
