@@ -16,6 +16,41 @@ const DIRECT_PIPELINE_BASE = "http://127.0.0.1:4599";
 // browser Origin header that the companion verifies before serving local data.
 export const PIPELINE_BASE = DIRECT_PIPELINE_BASE;
 
+/**
+ * Pitch models a song can be analysed with. Their tuning lives with the
+ * pipeline (work/pitch_models.py); this is what the interface offers.
+ */
+export type PitchModel = "crepe" | "rmvpe" | "swiftf0";
+
+export const DEFAULT_PITCH_MODEL: PitchModel = "crepe";
+
+export const PITCH_MODELS: ReadonlyArray<{
+  id: PitchModel;
+  label: string;
+  summary: string;
+}> = [
+  {
+    id: "crepe",
+    label: "CREPE",
+    summary: "The original. Its cleanup steps are the most thoroughly tuned.",
+  },
+  {
+    id: "rmvpe",
+    label: "RMVPE",
+    summary:
+      "Built for singing with other sound still present. Downloads about 345 MiB the first time.",
+  },
+  {
+    id: "swiftf0",
+    label: "SwiftF0",
+    summary: "Small and very fast, with a decisive sense of when a note starts and stops.",
+  },
+];
+
+export function pitchModelLabel(id: string | undefined): string {
+  return PITCH_MODELS.find((model) => model.id === id)?.label ?? "CREPE";
+}
+
 /** Lightweight descriptor for a grid card — no heavy contour arrays. */
 export type LibraryCard = {
   id: string;
@@ -23,6 +58,9 @@ export type LibraryCard = {
   artist: string;
   duration: number;
   builtin: boolean;
+  pitchModel?: PitchModel;
+  /** When the current contour was produced; changes on re-analysis. */
+  analyzedAt?: string;
 };
 
 type ManifestSong = {
@@ -30,6 +68,8 @@ type ManifestSong = {
   title: string;
   artist: string;
   duration: number;
+  pitchModel?: PitchModel;
+  analyzedAt?: string;
 };
 
 const builtinById = new Map(SONGS.map((song) => [song.id, song]));
@@ -56,6 +96,8 @@ export async function fetchLibrary(): Promise<LibraryCard[]> {
         artist: song.artist,
         duration: song.duration,
         builtin: false,
+        pitchModel: song.pitchModel,
+        analyzedAt: song.analyzedAt,
       }));
     }
   } catch {
@@ -75,6 +117,9 @@ export async function resolveSong(card: LibraryCard): Promise<Song> {
   });
   if (!contourResponse.ok) throw new Error(`Could not load "${card.title}".`);
   const contour = (await contourResponse.json()) as ContourData;
+  // Songs that have never been re-analysed carry no id, which keeps edits
+  // saved before this field existed valid for them.
+  if (card.analyzedAt) contour.analysisId = `${card.pitchModel ?? "crepe"}@${card.analyzedAt}`;
   return {
     id: card.id,
     title: card.title,
@@ -129,9 +174,11 @@ export async function fileToBackground(file: File, maxDim = 1200): Promise<strin
 
 export type JobStatus = {
   jobId: string;
+  kind?: "upload" | "reanalyze";
   songId: string;
   title?: string;
   artist?: string;
+  pitchModel?: PitchModel;
   status: "queued" | "running" | "done" | "error";
   step: string | null;
   steps: string[];
@@ -156,6 +203,7 @@ export type PipelineHealth = {
 };
 
 export const STEP_LABELS: Record<string, string> = {
+  downloading: "Downloading the pitch model",
   separating: "Separating vocals",
   isolating: "Isolating lead vocal",
   tracking: "Tracking pitch",
@@ -192,12 +240,30 @@ export async function fetchPipelineSetup(): Promise<{ ready: boolean; setup: Set
   return response.json();
 }
 
+/** Analyse a song already in the library again with the chosen pitch model. */
+export async function reanalyzeSong(
+  songId: string,
+  pitchModel: PitchModel,
+): Promise<{ jobId: string; songId: string }> {
+  const params = new URLSearchParams({ pitchModel });
+  const response = await fetch(
+    `${PIPELINE_BASE}/api/songs/${encodeURIComponent(songId)}/analysis?${params.toString()}`,
+    { method: "POST", headers: { "X-Sona-Action": "reanalyze" } },
+  );
+  if (!response.ok) {
+    const detail = (await response.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(detail?.error || "Re-analysis could not start.");
+  }
+  return response.json();
+}
+
 export async function uploadSong(
   file: File,
   title: string,
   artist: string,
+  pitchModel: PitchModel = DEFAULT_PITCH_MODEL,
 ): Promise<{ jobId: string; songId: string }> {
-  const params = new URLSearchParams({ title, artist });
+  const params = new URLSearchParams({ title, artist, pitchModel });
   const response = await fetch(`${PIPELINE_BASE}/api/songs?${params.toString()}`, {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream" },

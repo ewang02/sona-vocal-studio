@@ -15,9 +15,11 @@ import sys
 from pathlib import Path
 
 try:  # Support both script execution and imports from the test suite.
-    from .contour_pipeline_config import PRODUCTION_CONFIG
+    from .contour_pipeline_config import PRESETS
+    from .pitch_models import PITCH_MODELS, get_pitch_model
 except ImportError:  # pragma: no cover - exercised by the script entry point
-    from contour_pipeline_config import PRODUCTION_CONFIG
+    from contour_pipeline_config import PRESETS
+    from pitch_models import PITCH_MODELS, get_pitch_model
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +32,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("songs", nargs="+", help="one or more song ids")
     parser.add_argument("--model", choices=("tiny", "full"), default="tiny")
+    parser.add_argument(
+        "--pitch-model",
+        choices=sorted(PITCH_MODELS),
+        default="crepe",
+        help="pitch model for the lead contour; --model sizes CREPE only",
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -60,6 +68,14 @@ def main() -> None:
     args = parser.parse_args()
 
     python = sys.executable
+    tuning = get_pitch_model(args.pitch_model)
+    lead_pitch_filter = PRESETS[tuning.contour_preset].lead_pitch_filter
+    # CREPE keeps its exact historical command line; other models add theirs.
+    estimator_arguments = (
+        []
+        if tuning.name == "crepe"
+        else ["--estimator", tuning.name, "--estimator-role", "lead"]
+    )
     experiment = ROOT / "experiments/transcription_final"
     raw_directory = experiment / "raw_f0"
     raw_directory.mkdir(parents=True, exist_ok=True)
@@ -123,7 +139,8 @@ def main() -> None:
                     "--decoder",
                     "weighted_argmax",
                     "--pitch-filter",
-                    PRODUCTION_CONFIG.lead_pitch_filter,
+                    lead_pitch_filter,
+                    *estimator_arguments,
                     "--secondary-f0",
                     "pyin",
                     "--pyin-chunk-seconds",

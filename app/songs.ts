@@ -11,6 +11,13 @@ export type ContourData = {
   duration: number;
   range: number[];
   segments: ContourSegmentData[];
+  /** Pitch model that produced this contour, as recorded by the pipeline. */
+  pitchModel?: string;
+  /**
+   * Identifies one analysis of the song. Edits saved against an earlier
+   * analysis (a different model, or a re-run) are not applied to this one.
+   */
+  analysisId?: string;
 };
 
 export type Song = {

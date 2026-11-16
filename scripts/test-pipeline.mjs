@@ -22,6 +22,7 @@ if (!existsSync(python)) {
     "tests/test_pyin_fallback.py",
     "tests/test_octave_correct_contour.py",
     "tests/test_pitch_gate.py",
+    "tests/test_pitch_models.py",
   ];
   const result = spawnSync(python, ["-m", "pytest", ...tests], {
     cwd: root,

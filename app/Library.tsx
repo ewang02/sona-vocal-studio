@@ -4,18 +4,23 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { formatTime } from "./pitch-utils";
 import {
   BUILTIN_CARDS,
+  DEFAULT_PITCH_MODEL,
   fetchPipelineHealth,
   fetchPipelineSetup,
   fetchJob,
   fetchLibrary,
   fileToBackground,
   getBackground,
+  PITCH_MODELS,
+  pitchModelLabel,
+  reanalyzeSong,
   setBackground,
   startPipelineSetup,
   STEP_LABELS,
   uploadSong,
   type JobStatus,
   type LibraryCard,
+  type PitchModel,
   type SetupStatus,
 } from "./library-data";
 import { hostedLoopbackBlock, shouldAutoConnectForHostname } from "./loopback-access";
@@ -33,18 +38,41 @@ function ImageIcon() {
   );
 }
 
+function PitchModelField({
+  value,
+  onChange,
+}: {
+  value: PitchModel;
+  onChange: (next: PitchModel) => void;
+}) {
+  const selected = PITCH_MODELS.find((model) => model.id === value) ?? PITCH_MODELS[0];
+  return (
+    <label className="uploadField">
+      <span>Pitch model</span>
+      <select value={value} onChange={(event) => onChange(event.target.value as PitchModel)}>
+        {PITCH_MODELS.map((model) => (
+          <option key={model.id} value={model.id}>{model.label}</option>
+        ))}
+      </select>
+      <small className="uploadFieldHint">{selected.summary}</small>
+    </label>
+  );
+}
+
 function SongCard({
   card,
   background,
   onOpen,
   onPickBackground,
   onClearBackground,
+  onReanalyze,
 }: {
   card: LibraryCard;
   background: string | null;
   onOpen: (card: LibraryCard) => void;
   onPickBackground: (card: LibraryCard, file: File) => void;
   onClearBackground: (card: LibraryCard) => void;
+  onReanalyze: (card: LibraryCard) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const initials = card.title.replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "♪";
@@ -71,6 +99,17 @@ function SongCard({
           <span title={card.artist}>{card.artist || "Unknown artist"}</span>
         </div>
         <div className="songCardActions">
+          {!card.builtin && (
+            <button
+              type="button"
+              className="cardModelButton"
+              onClick={() => onReanalyze(card)}
+              title="Re-analyse with another pitch model"
+              aria-label={`${card.title} was analysed with ${pitchModelLabel(card.pitchModel)}. Re-analyse with another pitch model`}
+            >
+              {pitchModelLabel(card.pitchModel)}
+            </button>
+          )}
           <button
             type="button"
             className="cardIconButton"
@@ -120,6 +159,9 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   const [title, setTitle] = useState("");
   const [artist, setArtist] = useState("");
   const [uploadError, setUploadError] = useState("");
+  const [pitchModel, setPitchModel] = useState<PitchModel>(DEFAULT_PITCH_MODEL);
+  // Set while the panel is re-analysing a library song instead of adding one.
+  const [reanalyzeCard, setReanalyzeCard] = useState<LibraryCard | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
   const pollRef = useRef<number | null>(null);
   const setupPollRef = useRef<number | null>(null);
@@ -185,10 +227,11 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
   const closeUpload = useCallback(() => {
     if (setupPollRef.current) window.clearTimeout(setupPollRef.current);
     setUploadOpen(false);
+    setReanalyzeCard(null);
     resetUpload();
   }, [resetUpload]);
 
-  const openUpload = useCallback(() => {
+  const openPanel = useCallback(() => {
     setUploadOpen(true);
     setServerUp(null);
     void (async () => {
@@ -196,6 +239,18 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
       if (health) await refresh();
     })();
   }, [checkPipeline, refresh]);
+
+  const openUpload = useCallback(() => {
+    setReanalyzeCard(null);
+    openPanel();
+  }, [openPanel]);
+
+  const openReanalyze = useCallback((card: LibraryCard) => {
+    resetUpload();
+    setReanalyzeCard(card);
+    setPitchModel(card.pitchModel ?? DEFAULT_PITCH_MODEL);
+    openPanel();
+  }, [openPanel, resetUpload]);
 
   const pollSetup = useCallback(() => {
     const tick = async () => {
@@ -290,10 +345,11 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
         setUploadError("Install local song processing first.");
         return;
       }
-      const { jobId, songId } = await uploadSong(file, title.trim(), artist.trim());
+      const { jobId, songId } = await uploadSong(file, title.trim(), artist.trim(), pitchModel);
       setJob({
         jobId,
         songId,
+        pitchModel,
         status: "queued",
         step: null,
         steps: [],
@@ -309,7 +365,35 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
           : "Upload failed.",
       );
     }
-  }, [artist, checkPipeline, file, poll, title]);
+  }, [artist, checkPipeline, file, pitchModel, poll, title]);
+
+  const submitReanalyze = useCallback(async () => {
+    if (!reanalyzeCard) return;
+    setUploadError("");
+    try {
+      const { jobId, songId } = await reanalyzeSong(reanalyzeCard.id, pitchModel);
+      setJob({
+        jobId,
+        kind: "reanalyze",
+        songId,
+        title: reanalyzeCard.title,
+        pitchModel,
+        status: "queued",
+        step: null,
+        steps: [],
+        stepOrder: UPLOAD_STEPS,
+        duration: 0,
+        error: null,
+      });
+      poll(jobId);
+    } catch (error) {
+      setUploadError(
+        error instanceof Error
+          ? `${error.message} — is the local companion running? (npm run companion)`
+          : "Re-analysis could not start.",
+      );
+    }
+  }, [pitchModel, poll, reanalyzeCard]);
 
   const playProcessed = useCallback(() => {
     if (!job) return;
@@ -320,8 +404,15 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
     }
   }, [cards, closeUpload, job, onOpen]);
 
-  const currentStepIndex = job?.step ? UPLOAD_STEPS.indexOf(job.step) : -1;
+  // The download step appears only for a job that actually had to fetch a
+  // pitch model's weights.
+  const jobSteps = job?.steps.includes("downloading")
+    ? ["downloading", ...UPLOAD_STEPS]
+    : UPLOAD_STEPS;
+  const currentStepIndex = job?.step ? jobSteps.indexOf(job.step) : -1;
   const processing = job?.status === "queued" || job?.status === "running";
+  const panelTitle = reanalyzeCard ? `Re-analyse “${reanalyzeCard.title}”` : "Add a song";
+  const jobTitle = reanalyzeCard?.title || job?.title || title || job?.songId || "";
 
   return (
     <main className="appShell">
@@ -353,6 +444,7 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
             onOpen={onOpen}
             onPickBackground={pickBackground}
             onClearBackground={clearBackground}
+            onReanalyze={openReanalyze}
           />
         ))}
 
@@ -364,10 +456,10 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
       </div>
 
       {uploadOpen && (
-        <div className="uploadBackdrop" role="dialog" aria-modal="true" aria-label="Add a song">
+        <div className="uploadBackdrop" role="dialog" aria-modal="true" aria-label={panelTitle}>
           <div className="uploadPanel">
             <div className="uploadPanelHead">
-              <h2>Add a song</h2>
+              <h2>{panelTitle}</h2>
               <button type="button" className="uploadClose" onClick={closeUpload} aria-label="Close">
                 ×
               </button>
@@ -427,7 +519,30 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
                     </div>
                   </div>
                 )}
-                {serverUp === true && pipelineReady && (
+                {serverUp === true && pipelineReady && reanalyzeCard && (
+                  <>
+                    <p className="uploadNotice">
+                      Currently analysed with {pitchModelLabel(reanalyzeCard.pitchModel)}. Running
+                      another model replaces the song&apos;s target contour; the audio is not
+                      changed.
+                    </p>
+                    <PitchModelField value={pitchModel} onChange={setPitchModel} />
+                    {uploadError && <p className="uploadError">{uploadError}</p>}
+                    <div className="uploadButtons">
+                      <button type="button" className="ghostButton" onClick={closeUpload}>
+                        Cancel
+                      </button>
+                      <button type="button" className="primaryButton" onClick={submitReanalyze}>
+                        Re-analyse
+                      </button>
+                    </div>
+                    <p className="uploadFootnote">
+                      Edits you saved for this song belong to the current analysis and will not
+                      carry over. Takes a few minutes; the song stays playable meanwhile.
+                    </p>
+                  </>
+                )}
+                {serverUp === true && pipelineReady && !reanalyzeCard && (
                   <>
                     <label className="uploadField">
                       <span>MP3 file</span>
@@ -458,6 +573,7 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
                         onChange={(event) => setArtist(event.target.value)}
                       />
                     </label>
+                    <PitchModelField value={pitchModel} onChange={setPitchModel} />
                     {uploadError && <p className="uploadError">{uploadError}</p>}
                     <div className="uploadButtons">
                       <button type="button" className="ghostButton" onClick={closeUpload}>
@@ -477,9 +593,13 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
 
             {job && processing && (
               <div className="jobProgress">
-                <p className="jobHeadline">Transcribing “{title || job.songId}”…</p>
+                <p className="jobHeadline">
+                  {job.kind === "reanalyze"
+                    ? `Re-analysing “${jobTitle}” with ${pitchModelLabel(job.pitchModel)}…`
+                    : `Transcribing “${jobTitle}”…`}
+                </p>
                 <ol className="jobSteps">
-                  {UPLOAD_STEPS.map((step, index) => {
+                  {jobSteps.map((step, index) => {
                     const state =
                       currentStepIndex < 0
                         ? index === 0
@@ -504,7 +624,7 @@ export default function Library({ onOpen, onTraining }: { onOpen: (card: Library
 
             {job && job.status === "done" && (
               <div className="jobProgress">
-                <p className="jobHeadline jobDone">“{job.title || title}” is ready 🎉</p>
+                <p className="jobHeadline jobDone">“{jobTitle}” is ready 🎉</p>
                 <div className="uploadButtons">
                   <button type="button" className="ghostButton" onClick={closeUpload}>
                     Back to library

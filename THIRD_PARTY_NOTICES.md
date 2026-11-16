@@ -69,6 +69,25 @@ the license of separately published weights. Distributors and users are
 responsible for confirming that their intended use of each downloaded model
 and processed recording is permitted.
 
+## Pitch models
+
+Song analysis uses one of three pitch models, chosen per song.
+
+- **CREPE**, through the MIT-licensed `torchcrepe` package, which includes its
+  weights.
+- **SwiftF0** (Nieradzik, "SwiftF0: Fast and Accurate Monophonic Pitch
+  Detection", 2025), through the MIT-licensed `swift-f0` package, which
+  includes its model.
+- **RMVPE** (Wei et al., "RMVPE: A Robust Model for Vocal Pitch Estimation in
+  Polyphonic Music", 2023; reference implementation under Apache-2.0 at
+  https://github.com/Dream-High/RMVPE). Sona downloads the ONNX export
+  `rmvpe.onnx` published by the RVC project
+  (https://huggingface.co/lj1995/VoiceConversionWebUI, which declares the MIT
+  License) the first time a song is analysed with RMVPE, and verifies its size
+  and SHA-256 hash. The spectrogram settings and salience decoding in
+  `work/pitch_models.py` follow the RVC project's MIT-licensed inference code
+  (https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI).
+
 ## Other dependencies
 
 JavaScript and Python dependencies installed from `package-lock.json` and

@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   MODEL_MANIFEST_PATH,
+  pitchModelAssets,
   profileAssets,
   readModelManifest,
   sha256File,
@@ -46,6 +47,19 @@ test("model manifest pins every asset of both separator profiles", () => {
   }
   assert.throws(() => profileAssets(manifest, "missing"), /Unknown separator profile/);
   assert.doesNotThrow(() => JSON.parse(readFileSync(MODEL_MANIFEST_PATH, "utf8")));
+});
+
+test("only pitch models that ship as a download list assets", () => {
+  const manifest = readModelManifest();
+  const rmvpe = pitchModelAssets(manifest, "rmvpe");
+  assert.deepEqual(rmvpe.map((asset) => asset.filename), ["rmvpe.onnx"]);
+  assert.match(rmvpe[0].url, /^https:\/\/huggingface\.co\/lj1995\/VoiceConversionWebUI\//);
+  assert.match(rmvpe[0].sha256, /^[a-f0-9]{64}$/);
+  assert.ok(rmvpe[0].size > 100 * 1024 * 1024);
+  // CREPE ships with its Python package and SwiftF0 inside its own.
+  assert.deepEqual(pitchModelAssets(manifest, "crepe"), []);
+  assert.deepEqual(pitchModelAssets(manifest, "swiftf0"), []);
+  assert.deepEqual(pitchModelAssets(manifest, "unknown"), []);
 });
 
 test("model verification rejects changed bytes", async () => {

@@ -508,10 +508,11 @@ export default function StudioPlayer({ song, onBack }: { song: Song; onBack: () 
         !stored ||
         stored.hop !== song.contour.hop ||
         stored.duration !== song.contour.duration ||
+        stored.analysisId !== song.contour.analysisId ||
         !Array.isArray(stored.segments)
       ) {
-        // Missing, unreadable, or from a different analysis of this song: use
-        // the immutable shipped source.
+        // Missing, unreadable, or made against a different analysis of this
+        // song (another pitch model, or a re-run): use the current contour.
         return;
       }
       setEditedContour(stored);

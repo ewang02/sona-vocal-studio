@@ -66,6 +66,16 @@ export function createLocalLibrary(dataRoot = resolveSonaDataRoot()) {
     writeManifest(manifest);
   }
 
+  /** Merge fields into an existing entry, keeping its place in the library. */
+  function updateSong(songId, patch) {
+    const manifest = readManifest();
+    const index = manifest.songs.findIndex((song) => song.id === songId);
+    if (index < 0) return false;
+    manifest.songs[index] = { ...manifest.songs[index], ...patch, id: songId };
+    writeManifest(manifest);
+    return true;
+  }
+
   function containsSong(songId) {
     return readManifest().songs.some((song) => song.id === songId);
   }
@@ -114,6 +124,7 @@ export function createLocalLibrary(dataRoot = resolveSonaDataRoot()) {
     readManifest,
     writeManifest,
     upsertSong,
+    updateSong,
     containsSong,
     resolveAsset,
   };

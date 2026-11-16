@@ -1006,6 +1006,26 @@ a:focus-visible {
   color: var(--ink);
 }
 
+.cardModelButton {
+  padding: 0 8px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+}
+
+.cardModelButton:hover {
+  border-color: #4a4d43;
+  background: #20211b;
+  color: var(--ink);
+}
+
 .cardClearButton {
   padding: 0 8px;
   height: 30px;
@@ -1212,7 +1232,8 @@ a:focus-visible {
 }
 
 .uploadField input[type="text"],
-.uploadField input[type="file"] {
+.uploadField input[type="file"],
+.uploadField select {
   width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--line);
@@ -1220,6 +1241,18 @@ a:focus-visible {
   background: var(--surface-deep);
   color: var(--ink);
   font-size: 13px;
+}
+
+.uploadField select {
+  cursor: pointer;
+}
+
+.uploadFieldHint {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted-dim);
+  font-size: 11.5px;
+  line-height: 1.45;
 }
 
 .uploadField input[type="text"]::placeholder {

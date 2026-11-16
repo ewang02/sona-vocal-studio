@@ -425,6 +425,170 @@ def test_roformer_profile_separates_each_pair_in_one_pass_and_cleans_up(
     assert (tmp_path / "contour_out" / f"{song}_contour.csv").is_file()
 
 
+def run_pipeline_with_fakes(tmp_path, monkeypatch, **process_arguments):
+    """Run process() with every external command faked; return the commands."""
+    song = "song"
+    source = tmp_path / f"{song}.mp3"
+    source.write_bytes(b"source")
+    stem_helper = tmp_path / "work" / "separate_stems.py"
+    stem_helper.parent.mkdir()
+    stem_helper.write_text("helper")
+    commands: list[list[str]] = []
+    payloads: dict[str, dict] = {}
+
+    class FakeCache:
+        def __init__(self, root, cache_song, cache_marker=print):
+            self.root = root
+
+        def file_hash(self, path: Path) -> str:
+            return process_song.sha256(path)
+
+        def code_hashes(self, paths) -> dict[str, str]:
+            return {}
+
+        def run(self, stage, payload, outputs, action, *, force=False):
+            payloads[stage] = payload
+            action()
+            assert all(path.is_file() for path in outputs)
+            return False
+
+    def fake_run(command: list[str]) -> None:
+        commands.append(command)
+        if len(command) > 1 and command[1] == str(stem_helper):
+            primary = Path(command[command.index("--primary") + 1])
+            primary.parent.mkdir(parents=True, exist_ok=True)
+            primary.write_bytes(b"primary")
+            Path(command[command.index("--secondary") + 1]).write_bytes(b"secondary")
+        elif "contour.py" in command:
+            output = tmp_path / "contour_out" / f"{song}_contour.csv"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("anchor")
+        elif "work/build_final_transcriptions.py" in command:
+            output = (
+                tmp_path / "contour_out" / "lead_contours" / f"{song}_contour.csv"
+                if "--extract-only" in command
+                else tmp_path
+                / "experiments"
+                / "transcription_final"
+                / f"{song}_notes_final.json"
+            )
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("{}")
+        elif "work/export_contour.py" in command:
+            output = tmp_path / ".sona-data" / "library" / "data" / f"{song}-contour.json"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("{}")
+            (output.parent / f"{song}-pyin.json").write_text("{}")
+        elif command[0] == "ffmpeg":
+            Path(command[-1]).write_bytes(b"encoded instrumental")
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(process_song, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        process_song, "SEPARATOR_ROOT", tmp_path / "contour_out" / "separators"
+    )
+    monkeypatch.setattr(process_song, "STEM_SEPARATOR", stem_helper)
+    monkeypatch.setattr(process_song, "PYTHON", "python")
+    monkeypatch.setattr(process_song, "StageCache", FakeCache)
+    monkeypatch.setattr(process_song, "separator_profile", lambda: "roformer")
+    monkeypatch.setattr(
+        process_song,
+        "validate_models",
+        lambda hash_file, profile: dict(process_song.PROFILE_MODEL_HASHES[profile]),
+    )
+    monkeypatch.setattr(
+        process_song,
+        "validate_pitch_model",
+        lambda name, hash_file: dict(process_song.PITCH_MODEL_HASHES.get(name, {})),
+    )
+    monkeypatch.setattr(process_song, "installed_versions", lambda *packages: {})
+    monkeypatch.setattr(process_song, "command_version", lambda command: "ffmpeg")
+    monkeypatch.setattr(process_song, "ffprobe_duration", lambda path: 30.0)
+    monkeypatch.setattr(process_song, "run", fake_run)
+    process_song.process(song, source, **process_arguments)
+    return commands, payloads
+
+
+def option(command: list[str], name: str) -> str:
+    return command[command.index(name) + 1]
+
+
+def test_default_pitch_model_keeps_the_crepe_command_lines(tmp_path, monkeypatch) -> None:
+    commands, payloads = run_pipeline_with_fakes(tmp_path, monkeypatch)
+    anchor = next(command for command in commands if "contour.py" in command)
+    lead = next(command for command in commands if "--extract-only" in command)
+    export = next(command for command in commands if "work/export_contour.py" in command)
+    assert "--estimator" not in anchor
+    assert option(anchor, "--batch-size") == "512"
+    assert option(lead, "--pitch-model") == "crepe"
+    assert option(export, "--preset") == "production-v6r"
+    assert option(export, "--pitch-model") == "crepe"
+    assert payloads["anchor_extraction"]["pitch"]["pitchModel"] == "crepe"
+
+
+def test_chosen_pitch_model_runs_every_pitch_stage_with_its_own_tuning(
+    tmp_path, monkeypatch
+) -> None:
+    commands, payloads = run_pipeline_with_fakes(
+        tmp_path, monkeypatch, pitch_model="rmvpe"
+    )
+    anchor = next(command for command in commands if "contour.py" in command)
+    lead = next(command for command in commands if "--extract-only" in command)
+    export = next(command for command in commands if "work/export_contour.py" in command)
+    assert option(anchor, "--estimator") == "rmvpe"
+    assert option(anchor, "--estimator-role") == "anchor"
+    assert option(lead, "--pitch-model") == "rmvpe"
+    assert option(export, "--preset") == "rmvpe-v1"
+    assert option(export, "--pitch-model") == "rmvpe"
+    # Cached pitch work is keyed by the model, its tuning and its weights, so
+    # switching models or retuning one re-runs exactly those stages.
+    identity = payloads["anchor_extraction"]["pitch"]
+    assert identity == payloads["lead_pitch_extraction"]["pitch"]
+    assert identity["pitchModel"] == "rmvpe"
+    assert identity["tuning"] == process_song.PITCH_MODELS["rmvpe"].fingerprint()
+    assert set(identity["assets"]) == {"rmvpe.onnx"}
+    assert payloads["contour_export"]["pipelinePreset"] == "rmvpe-v1"
+    assert "pitch" not in payloads["stem_separation"]
+
+
+def test_lead_extraction_names_a_non_crepe_model_and_its_role(
+    tmp_path, monkeypatch
+) -> None:
+    song = "song"
+    lead = tmp_path / "contour_out" / "lead_vocals" / song / "lead.wav"
+    anchor = tmp_path / "contour_out" / f"{song}_contour.csv"
+    lead.parent.mkdir(parents=True)
+    lead.write_bytes(b"lead")
+    anchor.write_text("time,pitch\n")
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str]) -> None:
+        commands.append(command)
+        contour = tmp_path / "contour_out" / "lead_contours" / f"{song}_contour.csv"
+        contour.parent.mkdir(parents=True, exist_ok=True)
+        contour.write_text("time,pitch\n")
+
+    monkeypatch.setattr(build_final_transcriptions, "ROOT", tmp_path)
+    monkeypatch.setattr(build_final_transcriptions, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "build_final_transcriptions.py",
+            song,
+            "--pitch-model",
+            "swiftf0",
+            "--extract-only",
+        ],
+    )
+    build_final_transcriptions.main()
+
+    assert option(commands[0], "--estimator") == "swiftf0"
+    assert option(commands[0], "--estimator-role") == "lead"
+    assert option(commands[0], "--secondary-f0") == "pyin"
+
+
 def test_intermediate_stems_are_kept_unless_cleanup_is_requested(tmp_path) -> None:
     stems = tmp_path / "separators" / "song"
     stems.mkdir(parents=True)

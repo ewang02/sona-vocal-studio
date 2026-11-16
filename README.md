@@ -96,6 +96,26 @@ install them yourself:
 - A current version of Chrome, Edge, Firefox, or Safari
 - A microphone for live feedback and recording
 
+## Choosing a pitch model
+
+Each song's target contour is traced by a pitch model, and you can pick which
+one per song. Choose it in the **Add a song** panel, or click the model name
+on a song's card to re-analyse that song with a different one.
+
+| Model | Notes |
+| --- | --- |
+| **CREPE** (default) | The original. Its cleanup steps are the most thoroughly tuned. |
+| **RMVPE** | Built for singing with other sound still present. Downloads about 345 MiB the first time it is chosen. |
+| **SwiftF0** | Small and very fast, with a decisive sense of when a note starts and stops. |
+
+No model is best on every song, so if a contour looks wrong, trying another
+model is often quicker than repairing it by hand. Re-analysis replaces the
+song's target contour and leaves its audio alone; contour edits you saved
+belong to the analysis they were made on and do not carry over. The companion
+normally deletes a song's separated stems once it is published, so re-analysis
+separates the song again; start the companion with `SONA_KEEP_INTERMEDIATES=1`
+to make switching models take seconds instead of minutes.
+
 ## Using the studio
 
 ### Practicing
@@ -286,7 +306,11 @@ The main pipeline files are:
 - `work/separate_stems.py` — RoFormer separation: one pass per stem pair
 - `work/separate_kim_stem.py` — compact-set vocal and instrumental separation
 - `work/separate_lead_vocals.py` — compact-set lead and backing separation
-- `contour.py` — CREPE and pYIN extraction
+- `contour.py` — pitch extraction with the song's chosen model, plus pYIN
+- `work/pitch_models.py` — the selectable pitch models and each one's own
+  thresholds and tuning
+- `work/calibrate_pitch_model.py` — measures a model's confidence thresholds
+  from kept stems
 - `work/export_contour.py` — contour correction and browser export
 - `work/contour_pipeline_config.py` — named contour presets
 - `transcribe_notes.py` — note evidence for conservative contour repairs
@@ -296,13 +320,28 @@ Model URLs, sizes, and hashes live in
 files are ignored by Git and should not be replaced without updating and
 revalidating that manifest.
 
+Each pitch model has its own entry in `work/pitch_models.py`: the native
+confidence values it should be held to at each level the pipeline tests, its
+voicing-gate levels, and the name of its own contour preset in
+`work/contour_pipeline_config.py`. Changing one model's entry or preset never
+affects another model, and cached work for that model is redone automatically.
+The RMVPE and SwiftF0 thresholds were measured on a single song, so treat them
+as a starting point: keep a few songs' stems, run
+`.venv/bin/python work/calibrate_pitch_model.py --model rmvpe <song ids>`, and
+paste the rows it prints.
+
 To process a song directly into the local library after setup:
 
 ```sh
 .venv/bin/python work/process_song.py example \
   --mp3 /path/to/example.mp3 \
-  --output-dir .sona-data/library
+  --output-dir .sona-data/library \
+  --pitch-model crepe
 ```
+
+`--pitch-model` takes `crepe`, `rmvpe`, or `swiftf0`. RMVPE's weights are
+fetched by the companion on first use; from the command line run
+`node scripts/model-assets.mjs pitch rmvpe` once beforehand.
 
 The pipeline creates missing output directories automatically and can resume
 from its integrity-checked stage cache. Add `--force` to rebuild every stage.

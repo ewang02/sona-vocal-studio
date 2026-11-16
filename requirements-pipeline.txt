@@ -10,6 +10,7 @@ numpy==2.4.6
 pytest==9.1.1
 scipy==1.18.0
 soundfile==0.14.0
+swift-f0==0.3.0
 torch==2.13.0
 torchaudio==2.11.0
 torchcrepe==0.0.24

@@ -8,7 +8,8 @@
  * keeps the user's source audio and generated library in private local storage.
  *
  * Endpoints (CORS-limited to the Sona UI):
- *   POST /api/songs?title=…&artist=…   body = raw mp3 bytes  → { jobId, songId }
+ *   POST /api/songs?title=…&artist=…&pitchModel=…   body = raw mp3 bytes  → { jobId, songId }
+ *   POST /api/songs/:id/analysis?pitchModel=…   re-analyse a library song  → { jobId, songId }
  *   GET  /api/jobs/:id                  → { status, step, steps, error, songId }
  *   GET  /api/library                   → the local manifest
  *   GET  /api/songs/:id/:kind           → source/instrumental/contour/repair
@@ -40,7 +41,14 @@ import {
   parseByteRange,
   SONG_ID_PATTERN,
 } from "./local-library.mjs";
+import {
+  ensurePitchModelAssets,
+  MODEL_DIRECTORY,
+  pitchModelAssets,
+  readModelManifest,
+} from "../scripts/model-assets.mjs";
 import { pipelineReadiness } from "../scripts/pipeline-state.mjs";
+import { DEFAULT_PITCH_MODEL, resolvePitchModel } from "./pitch-models.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = Number(process.env.PORT || 4599);
@@ -131,14 +139,42 @@ function pump() {
   });
 }
 
-function runJob(job) {
-  return new Promise((resolvePromise) => {
-    job.status = "running";
+/** A re-analysis reads the library's own copy of the song; never delete it. */
+function discardJobSource(job) {
+  if (!job.keepSource) rmSync(job.uploadPath, { force: true });
+}
+
+/**
+ * Fetch a pitch model's weights the first time a song asks for that model.
+ * Choosing the model is the explicit request; nothing is downloaded for
+ * models that are never selected.
+ */
+async function preparePitchModel(job) {
+  const assets = pitchModelAssets(readModelManifest(), job.pitchModel);
+  if (assets.every((asset) => existsSync(join(MODEL_DIRECTORY, asset.filename)))) return;
+  job.step = "downloading";
+  job.steps.push("downloading");
+  await ensurePitchModelAssets(job.pitchModel);
+}
+
+async function runJob(job) {
+  job.status = "running";
+  try {
+    await preparePitchModel(job);
+  } catch (error) {
+    job.status = "error";
+    job.error = `The ${job.pitchModel} pitch model could not be downloaded: ${error.message || error}`;
+    discardJobSource(job);
+    return;
+  }
+  await new Promise((resolvePromise) => {
     const child = spawn(pythonBin, [
       "work/process_song.py",
       job.songId,
       "--mp3",
       job.uploadPath,
+      "--pitch-model",
+      job.pitchModel,
       "--output-dir",
       library.libraryRoot,
       // Every upload gets a fresh id, so the four full-length WAV stems a
@@ -193,13 +229,20 @@ function runJob(job) {
     child.on("close", (code) => {
       if (stdoutBuffer) handleLine(stdoutBuffer);
       if (code === 0 && !job.error) {
-        library.upsertSong({
-          id: job.songId,
-          title: job.title,
-          artist: job.artist,
-          duration: job.duration || 0,
-          createdAt: new Date().toISOString(),
-        });
+        const analyzedAt = new Date().toISOString();
+        if (job.kind === "reanalyze") {
+          library.updateSong(job.songId, { pitchModel: job.pitchModel, analyzedAt });
+        } else {
+          library.upsertSong({
+            id: job.songId,
+            title: job.title,
+            artist: job.artist,
+            duration: job.duration || 0,
+            createdAt: analyzedAt,
+            pitchModel: job.pitchModel,
+            analyzedAt,
+          });
+        }
         job.status = "done";
         job.step = "done";
       } else {
@@ -209,7 +252,7 @@ function runJob(job) {
           stderrTail.split("\n").filter(Boolean).pop() ||
           `pipeline exited with code ${code}`;
       }
-      rmSync(job.uploadPath, { force: true });
+      discardJobSource(job);
       resolvePromise();
     });
   });
@@ -367,6 +410,8 @@ async function handleUpload(request, response, url) {
   if (title.length > 120 || artist.length > 120) {
     return sendJson(request, response, 400, { error: "Title and artist must be 120 characters or fewer." });
   }
+  const pitchModel = resolvePitchModel(url.searchParams.get("pitchModel"));
+  if (!pitchModel) return sendJson(request, response, 400, { error: "Unknown pitch model." });
 
   let body;
   try {
@@ -385,9 +430,11 @@ async function handleUpload(request, response, url) {
 
   const job = {
     jobId: randomUUID(),
+    kind: "upload",
     songId,
     title,
     artist,
+    pitchModel,
     status: "queued",
     step: null,
     steps: [],
@@ -397,6 +444,53 @@ async function handleUpload(request, response, url) {
     timings: {},
     error: null,
     uploadPath,
+  };
+  enqueue(job);
+  sendJson(request, response, 202, { jobId: job.jobId, songId });
+}
+
+/** Re-run pitch analysis for a song already in the library with another model. */
+function handleReanalysis(request, response, url, songId) {
+  if (!requireBrowserOrigin(request, response)) return;
+  // A custom header forces a CORS preflight, so no cross-site form can start
+  // minutes of processing.
+  if (request.headers["x-sona-action"] !== "reanalyze") {
+    return sendJson(request, response, 400, { error: "Missing re-analysis confirmation." });
+  }
+  const pitchModel = resolvePitchModel(url.searchParams.get("pitchModel"));
+  if (!pitchModel) return sendJson(request, response, 400, { error: "Unknown pitch model." });
+  const source = SONG_ID_PATTERN.test(songId) ? library.resolveAsset(songId, "source") : null;
+  const song = library.readManifest().songs.find((entry) => entry.id === songId);
+  if (!source || !song) return sendJson(request, response, 404, { error: "Song not found." });
+  refreshReadiness();
+  if (!readiness.ready) {
+    return sendJson(request, response, 503, {
+      error: readiness.reason || "Song processing is not ready.",
+      code: "pipeline_not_ready",
+    });
+  }
+  const busy = [...jobs.values()].some(
+    (job) => job.songId === songId && (job.status === "queued" || job.status === "running"),
+  );
+  if (busy) return sendJson(request, response, 409, { error: "This song is already being processed." });
+
+  const job = {
+    jobId: randomUUID(),
+    kind: "reanalyze",
+    songId,
+    title: String(song.title || "Untitled"),
+    artist: String(song.artist || ""),
+    pitchModel,
+    status: "queued",
+    step: null,
+    steps: [],
+    stepOrder: STEP_ORDER,
+    duration: 0,
+    cache: {},
+    timings: {},
+    error: null,
+    uploadPath: source.path,
+    keepSource: true,
   };
   enqueue(job);
   sendJson(request, response, 202, { jobId: job.jobId, songId });
@@ -460,16 +554,20 @@ const server = createServer(async (request, response) => {
   if (request.method === "POST" && url.pathname === "/api/songs") {
     return handleUpload(request, response, url);
   }
+  const analysisMatch = /^\/api\/songs\/([a-z0-9-]+)\/analysis$/.exec(url.pathname);
+  if (request.method === "POST" && analysisMatch) {
+    return handleReanalysis(request, response, url, analysisMatch[1]);
+  }
   if (request.method === "GET" && url.pathname.startsWith("/api/jobs/")) {
     if (!requireBrowserOrigin(request, response)) return;
     const job = jobs.get(url.pathname.slice("/api/jobs/".length));
     if (!job) return sendJson(request, response, 404, { error: "unknown job" });
     const {
-      jobId, songId, title, artist, status, step, steps, stepOrder,
+      jobId, kind, songId, title, artist, pitchModel, status, step, steps, stepOrder,
       duration, cache, timings, error,
     } = job;
     return sendJson(request, response, 200, {
-      jobId, songId, title, artist, status, step, steps, stepOrder,
+      jobId, kind, songId, title, artist, pitchModel, status, step, steps, stepOrder,
       duration, cache, timings, error,
     });
   }
@@ -477,12 +575,15 @@ const server = createServer(async (request, response) => {
     if (!requireBrowserOrigin(request, response)) return;
     const songs = library.readManifest().songs
       .filter((song) => SONG_ID_PATTERN.test(song?.id || ""))
-      .map(({ id, title, artist, duration, createdAt }) => ({
+      .map(({ id, title, artist, duration, createdAt, pitchModel, analyzedAt }) => ({
         id,
         title: String(title || "Untitled"),
         artist: String(artist || ""),
         duration: Number.isFinite(Number(duration)) ? Number(duration) : 0,
+        // Songs added before the model was selectable were analysed with CREPE.
+        pitchModel: resolvePitchModel(pitchModel) ?? DEFAULT_PITCH_MODEL,
         ...(createdAt ? { createdAt: String(createdAt) } : {}),
+        ...(analyzedAt ? { analyzedAt: String(analyzedAt) } : {}),
       }));
     return sendJson(request, response, 200, { songs });
   }

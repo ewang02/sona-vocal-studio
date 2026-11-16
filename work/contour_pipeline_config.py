@@ -336,6 +336,13 @@ PRESETS = {
     ),
 }
 
+# Each selectable pitch model (work/pitch_models.py) exports through its own
+# preset, so tuning one model never moves another. Both start from the
+# production chain; their confidence scales are aligned upstream, where each
+# model declares its own thresholds.
+PRESETS["rmvpe-v1"] = replace(PRODUCTION_V6R_CONFIG)
+PRESETS["swiftf0-v1"] = replace(PRODUCTION_V6R_CONFIG)
+
 # Simplified production subset selected from isolated-vocal and commercial-
 # separator ablations. The guarded RMS fallback stays experimental after
 # failing the frozen-test false-alarm guardrail.

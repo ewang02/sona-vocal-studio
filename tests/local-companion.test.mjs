@@ -82,11 +82,13 @@ test("returns a sanitized private library", networkOptions, async () => {
   const response = await request("/api/library");
   assert.equal(response.status, 200);
   const manifest = await response.json();
+  // A song added before the pitch model was selectable reads as CREPE.
   assert.deepEqual(manifest.songs, [{
     id: "test-song",
     title: "Test Song",
     artist: "Singer",
     duration: 12,
+    pitchModel: "crepe",
   }]);
   assert.doesNotMatch(JSON.stringify(manifest), /private|internalPath/);
 });
@@ -142,4 +144,43 @@ test("rejects traversal, missing assets, hostile origins, and simple upload CSRF
   });
   assert.equal(upload.status, 403);
   assert.deepEqual(readdirSync(join(dataRoot, "uploads")), []);
+});
+
+test("re-analysis is confirmed, validated, and never started by another site", networkOptions, async () => {
+  const start = (path, headers = { "x-sona-action": "reanalyze" }) =>
+    request(path, { method: "POST", headers });
+
+  // A plain cross-site form cannot set the confirmation header.
+  assert.equal((await start("/api/songs/test-song/analysis?pitchModel=rmvpe", {})).status, 400);
+  const unknownModel = await start("/api/songs/test-song/analysis?pitchModel=yin");
+  assert.equal(unknownModel.status, 400);
+  assert.match((await unknownModel.json()).error, /pitch model/i);
+  assert.equal((await start("/api/songs/missing-song/analysis?pitchModel=rmvpe")).status, 404);
+  assert.equal((await start("/api/songs/%2e%2e/analysis?pitchModel=rmvpe")).status, 404);
+
+  const hostile = await fetch(`${base}/api/songs/test-song/analysis?pitchModel=rmvpe`, {
+    method: "POST",
+    headers: { origin: "https://attacker.example", "x-sona-action": "reanalyze" },
+  });
+  assert.equal(hostile.status, 403);
+
+  const preflight = await request("/api/songs/test-song/analysis", {
+    method: "OPTIONS",
+    headers: {
+      "access-control-request-method": "POST",
+      "access-control-request-headers": "x-sona-action",
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.match(preflight.headers.get("access-control-allow-headers") ?? "", /X-Sona-Action/i);
+});
+
+test("uploads name a pitch model the pipeline offers", networkOptions, async () => {
+  const { PITCH_MODELS, DEFAULT_PITCH_MODEL, resolvePitchModel } = await import(
+    "../server/pitch-models.mjs"
+  );
+  assert.deepEqual(PITCH_MODELS, ["crepe", "rmvpe", "swiftf0"]);
+  assert.equal(resolvePitchModel(undefined), DEFAULT_PITCH_MODEL);
+  assert.equal(resolvePitchModel(" SwiftF0 "), "swiftf0");
+  assert.equal(resolvePitchModel("../crepe"), null);
 });

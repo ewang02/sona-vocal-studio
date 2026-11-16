@@ -37,8 +37,18 @@ from voicing import coherent_voicing_mask
 from work.contour_filters import filter_f0
 from work.contour_pipeline_config import PRESETS
 from work.hardware_acceleration import torch_device_name
+from work.pitch_models import (
+    PITCH_MODELS,
+    calibrate_confidence,
+    estimate_rmvpe,
+    estimate_swiftf0,
+    get_pitch_model,
+)
 
 CREPE_SR = 16000  # torchcrepe expects 16 kHz
+DEFAULT_MODEL_DIR = (
+    Path(__file__).resolve().parent / "contour_out" / "models" / "audio-separator"
+)
 
 
 def deterministic_weighted_argmax(logits):
@@ -93,15 +103,48 @@ def extract_f0(
     chunk_seconds: float = 30.0,
     decoder_name: str = "weighted_argmax",
     pitch_filter: str = "mean_hz_90",
+    estimator: str = "crepe",
+    estimator_role: str = "lead",
+    model_dir: Path | None = None,
 ):
     import gc
     import librosa
     import torch
     import torchcrepe
 
-    print(f"[2/4] Running CREPE ({model} model, {hop_ms} ms hop, fmax {fmax:.0f} Hz)...")
     audio, _ = librosa.load(str(vocal_path), sr=CREPE_SR, mono=True)
     hop_length = int(CREPE_SR * hop_ms / 1000)
+    if estimator != "crepe":
+        tuning = get_pitch_model(estimator)
+        print(
+            f"[2/4] Running {tuning.label} ({hop_ms} ms hop, fmax {fmax:.0f} Hz, "
+            f"{estimator_role} tuning)..."
+        )
+        if estimator == "rmvpe":
+            f0_native, confidence_native = estimate_rmvpe(
+                audio,
+                hop_length,
+                (model_dir or DEFAULT_MODEL_DIR) / str(tuning.asset),
+            )
+        else:
+            f0_native, confidence_native = estimate_swiftf0(
+                audio, hop_length, 65.0, fmax
+            )
+        target_length = len(audio) // hop_length + 1
+        f0_raw_np = np.asarray(f0_native[:target_length], dtype=np.float32)
+        confidence_native = np.asarray(
+            confidence_native[:target_length], dtype=np.float32
+        )
+        # Everything downstream compares confidence against fixed levels, so
+        # bring this model's own scale onto the common one first.
+        periodicity_raw_np = calibrate_confidence(
+            confidence_native, tuning.confidence_knots(estimator_role)
+        ).astype(np.float32)
+        return finish_extraction(
+            audio, f0_raw_np, periodicity_raw_np, hop_ms, hop_length, pitch_filter
+        ) + (confidence_native,)
+
+    print(f"[2/4] Running CREPE ({model} model, {hop_ms} ms hop, fmax {fmax:.0f} Hz)...")
     # Select the fastest Torch backend supported by this installation. Small
     # floating-point drift between devices is below transcription tolerance.
     device = torch_device_name(torch)
@@ -192,6 +235,22 @@ def extract_f0(
         torch.set_num_threads(max(1, torch_threads))
         f0_raw_np, periodicity_raw_np = predict_chunks(device)
 
+    # torchcrepe caches the network globally. Release it before optional pYIN
+    # so two pitch models are never resident together in this process.
+    if hasattr(torchcrepe.infer, "model"):
+        delattr(torchcrepe.infer, "model")
+    gc.collect()
+
+    return finish_extraction(
+        audio, f0_raw_np, periodicity_raw_np, hop_ms, hop_length, pitch_filter
+    ) + (None,)
+
+
+def finish_extraction(audio, f0_raw_np, periodicity_raw_np, hop_ms, hop_length, pitch_filter):
+    """Shared cleanup for any estimator's frame-level pitch and confidence."""
+    import torch
+    import torchcrepe
+
     # Preserve the frame-level model output before the standard display
     # cleanup. A 90 ms mean is useful for looking at a contour but can erase
     # much of a 100–150 ms note; note transcription needs access to both.
@@ -225,12 +284,6 @@ def extract_f0(
         for i in range(len(f0))
     ])
     rms_floor = np.percentile(rms[rms > 0], 20) * 0.5 if np.any(rms > 0) else 0.0
-
-    # torchcrepe caches the network globally. Release it before optional pYIN
-    # so two pitch models are never resident together in this process.
-    if hasattr(torchcrepe.infer, "model"):
-        delattr(torchcrepe.infer, "model")
-    gc.collect()
 
     return times, f0, conf, rms, rms_floor, audio, f0_raw, conf_raw
 
@@ -487,9 +540,10 @@ def main():
     ap = argparse.ArgumentParser(description="Pitch-contour karaoke feasibility test")
     ap.add_argument("input", type=Path, help="song mp3 (or vocal stem with --no-separate)")
     ap.add_argument("--no-separate", action="store_true", help="input is already an isolated vocal")
-    ap.add_argument("--conf", type=float, default=0.55, help="reliable confidence threshold for voicing (default 0.55)")
-    ap.add_argument("--recover-conf", type=float, default=0.30,
-                    help="lower confidence floor for locally coherent recovery frames (default 0.30)")
+    ap.add_argument("--conf", type=float, default=None,
+                    help="reliable confidence threshold for voicing (default: the pitch model's own tuning, 0.55 for CREPE)")
+    ap.add_argument("--recover-conf", type=float, default=None,
+                    help="lower confidence floor for locally coherent recovery frames (default: the pitch model's own tuning, 0.30 for CREPE)")
     ap.add_argument("--no-coherent-recover", action="store_true",
                     help="disable low-confidence recovery and use the reliable confidence gate only")
     ap.add_argument("--adaptive-conf", action="store_true",
@@ -500,6 +554,24 @@ def main():
     ap.add_argument("--fmax", type=float, default=1000.0,
                     help="CREPE search ceiling in Hz; leave headroom above the song's top note (default 1000)")
     ap.add_argument("--model", choices=["full", "tiny"], default="full", help="CREPE model size")
+    ap.add_argument(
+        "--estimator",
+        choices=sorted(PITCH_MODELS),
+        default="crepe",
+        help="pitch model; each has its own tuning in work/pitch_models.py (default crepe)",
+    )
+    ap.add_argument(
+        "--estimator-role",
+        choices=["anchor", "lead"],
+        default="lead",
+        help="which of the model's confidence tunings applies to this stem (default lead)",
+    )
+    ap.add_argument(
+        "--model-dir",
+        type=Path,
+        default=DEFAULT_MODEL_DIR,
+        help="directory holding downloaded pitch-model weights",
+    )
     ap.add_argument(
         "--batch-size",
         type=int,
@@ -573,7 +645,7 @@ def main():
     else:
         vocal_path = separate_vocals(args.input, args.outdir / "demucs")
 
-    times, f0, conf, rms, rms_floor, audio, f0_raw, conf_raw = extract_f0(
+    times, f0, conf, rms, rms_floor, audio, f0_raw, conf_raw, conf_native = extract_f0(
         vocal_path,
         args.hop_ms,
         args.model,
@@ -583,13 +655,21 @@ def main():
         args.chunk_seconds,
         args.decoder,
         args.pitch_filter,
+        args.estimator,
+        args.estimator_role,
+        args.model_dir,
     )
     midi = hz_to_midi(f0)
     midi_raw = hz_to_midi(f0_raw)
+    tuning = get_pitch_model(args.estimator)
     voiced, gate = coherent_voicing_mask(
         times, midi, conf, rms, rms_floor,
-        conf_hi=args.conf,
-        conf_lo=args.recover_conf,
+        conf_hi=args.conf if args.conf is not None else tuning.voicing_reliable,
+        conf_lo=(
+            args.recover_conf
+            if args.recover_conf is not None
+            else tuning.voicing_recover
+        ),
         recover=not args.no_coherent_recover,
         adaptive=args.adaptive_conf,
         coherence_st=args.coherence_st,
@@ -642,6 +722,10 @@ def main():
         )
         columns.extend([f0_pyin, hz_to_midi(f0_pyin), confidence_pyin])
         names.extend(["f0_hz_pyin", "midi_pyin", "confidence_pyin"])
+    if conf_native is not None:
+        # The model's own, uncalibrated confidence, kept for re-tuning.
+        columns.append(conf_native)
+        names.append("confidence_native")
     header = ",".join(names)
     temporary_csv = csv_path.with_suffix(csv_path.suffix + ".tmp")
     np.savetxt(

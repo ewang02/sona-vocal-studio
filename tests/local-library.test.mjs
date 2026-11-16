@@ -56,6 +56,40 @@ test("local library serves only fixed assets for manifest-listed song ids", () =
   }
 });
 
+test("updating a song merges fields and keeps its place in the library", () => {
+  const root = mkdtempSync(join(tmpdir(), "sona-library-"));
+  try {
+    const library = createLocalLibrary(root);
+    library.writeManifest({
+      songs: [
+        { id: "first", title: "First", createdAt: "2026-01-01T00:00:00.000Z" },
+        { id: "second", title: "Second" },
+      ],
+    });
+    assert.equal(
+      library.updateSong("first", { pitchModel: "rmvpe", analyzedAt: "2026-02-02T00:00:00.000Z" }),
+      true,
+    );
+    assert.deepEqual(library.readManifest().songs, [
+      {
+        id: "first",
+        title: "First",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        pitchModel: "rmvpe",
+        analyzedAt: "2026-02-02T00:00:00.000Z",
+      },
+      { id: "second", title: "Second" },
+    ]);
+    // A patch can never rename a song or create one.
+    assert.equal(library.updateSong("first", { id: "other" }), true);
+    assert.equal(library.readManifest().songs[0].id, "first");
+    assert.equal(library.updateSong("missing", { pitchModel: "rmvpe" }), false);
+    assert.equal(library.readManifest().songs.length, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("parses bounded, open, and suffix byte ranges", () => {
   assert.deepEqual(parseByteRange("bytes=2-5", 10), { start: 2, end: 5 });
   assert.deepEqual(parseByteRange("bytes=6-", 10), { start: 6, end: 9 });

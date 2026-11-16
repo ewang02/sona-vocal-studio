@@ -115,6 +115,7 @@ def export(
     out_dir: Path,
     config=PRODUCTION_CONFIG,
     preset: str = PRODUCTION_PRESET,
+    pitch_model: str = "crepe",
 ) -> None:
     lead_contour_path = song_root / "contour_out" / "lead_contours" / f"{song}_contour.csv"
     contour_path = (
@@ -451,6 +452,7 @@ def export(
         "hop": round(hop, 5),
         "duration": round(float(times[-1]) + hop, 3),
         "pipelinePreset": preset,
+        "pitchModel": pitch_model,
         "source": "lead-gated" if contour_path == lead_contour_path else "broad-vocals",
         "pitchSource": pitch_source,
         "gate": {
@@ -536,6 +538,11 @@ if __name__ == "__main__":
         help="named contour pipeline configuration (default: production)",
     )
     parser.add_argument(
+        "--pitch-model",
+        default="crepe",
+        help="pitch model that produced the contours, recorded in the export",
+    )
+    parser.add_argument(
         "--pyin-only",
         action="store_true",
         help="publish only the lead-pYIN browser repair source",
@@ -546,4 +553,11 @@ if __name__ == "__main__":
         if args.pyin_only:
             export_pyin_repair_source(args.root, song_name, args.out)
         else:
-            export(args.root, song_name, args.out, PRESETS[args.preset], args.preset)
+            export(
+                args.root,
+                song_name,
+                args.out,
+                PRESETS[args.preset],
+                args.preset,
+                args.pitch_model,
+            )

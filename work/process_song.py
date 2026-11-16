@@ -50,13 +50,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 try:  # Support both ``python work/process_song.py`` and test/module imports.
-    from .contour_pipeline_config import PRODUCTION_CONFIG
+    from .contour_pipeline_config import PRESETS, PRODUCTION_CONFIG
     from .hardware_acceleration import inference_hardware, separator_profile
     from .pipeline_cache import StageCache
+    from .pitch_models import DEFAULT_PITCH_MODEL, PITCH_MODELS, get_pitch_model
 except ImportError:  # pragma: no cover - exercised by the script entry point
-    from contour_pipeline_config import PRODUCTION_CONFIG
+    from contour_pipeline_config import PRESETS, PRODUCTION_CONFIG
     from hardware_acceleration import inference_hardware, separator_profile
     from pipeline_cache import StageCache
+    from pitch_models import DEFAULT_PITCH_MODEL, PITCH_MODELS, get_pitch_model
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,11 +76,16 @@ ROFORMER_VOCAL_CONFIG = "vocals_mel_band_roformer.yaml"
 ROFORMER_LEAD_MODEL = "mel_band_roformer_karaoke_gabox.ckpt"
 ROFORMER_LEAD_CONFIG = "config_mel_band_roformer_karaoke_gabox.yaml"
 # Weights and their configs, per separator profile, pinned by SHA-256.
+_MODEL_MANIFEST = json.loads(MODEL_ASSET_MANIFEST.read_text())
 PROFILE_MODEL_HASHES = {
     profile: {asset["filename"]: asset["sha256"] for asset in entry["assets"]}
-    for profile, entry in json.loads(MODEL_ASSET_MANIFEST.read_text())[
-        "profiles"
-    ].items()
+    for profile, entry in _MODEL_MANIFEST["profiles"].items()
+}
+# Weights for the selectable pitch models that need a download. They are
+# fetched the first time a song asks for that model, not during setup.
+PITCH_MODEL_HASHES = {
+    name: {asset["filename"]: asset["sha256"] for asset in entry["assets"]}
+    for name, entry in _MODEL_MANIFEST.get("pitchModels", {}).items()
 }
 MODEL_METADATA_HASHES = {
     "download_checks.json": "e3d2e06b67e9f1073d668295bcc76821030bb97359d2583bbd4bed3afbe18264",
@@ -145,6 +152,25 @@ def validate_models(hash_file=sha256, profile: str | None = None) -> dict[str, s
                 f"expected {expected_hash}, got {actual_hash}"
             )
     return dict(model_hashes)
+
+
+def validate_pitch_model(name: str, hash_file=sha256) -> dict[str, str]:
+    """Require the pinned weights of a pitch model that ships as a download."""
+    hashes = PITCH_MODEL_HASHES.get(name, {})
+    for filename, expected_hash in hashes.items():
+        path = MODEL_DIR / filename
+        if not path.exists():
+            raise RuntimeError(
+                f"missing {name} pitch model asset: {filename}; "
+                f"run `node scripts/model-assets.mjs pitch {name}`"
+            )
+        actual_hash = hash_file(path)
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"pitch model asset hash mismatch for {filename}: "
+                f"expected {expected_hash}, got {actual_hash}"
+            )
+    return dict(hashes)
 
 
 def installed_versions(*packages: str) -> dict[str, str]:
@@ -312,6 +338,7 @@ def process(
     mp3: Path,
     *,
     force: bool = False,
+    pitch_model: str = DEFAULT_PITCH_MODEL,
     clean_intermediates: bool = False,
     branch_workers: int = 2,
     kim_batch_size: int = 1,
@@ -350,6 +377,17 @@ def process(
     profile = separator_profile()
     marker(f"::profile separator={profile}")
     model_hashes = validate_models(cache.file_hash, profile)
+    tuning = get_pitch_model(pitch_model)
+    contour_config = PRESETS[tuning.contour_preset]
+    marker(f"::pitch-model {tuning.name} preset={tuning.contour_preset}")
+    # Everything that should invalidate cached pitch work when this model or
+    # its tuning changes.
+    pitch_identity = {
+        "pitchModel": tuning.name,
+        "tuning": tuning.fingerprint(),
+        "assets": validate_pitch_model(tuning.name, cache.file_hash),
+    }
+    crepe = tuning.name == "crepe"
 
     def code_hashes(*relative_paths: str) -> dict[str, str]:
         return cache.code_hashes(
@@ -357,7 +395,7 @@ def process(
         )
 
     pitch_environment = installed_versions(
-        "numpy", "scipy", "librosa", "soundfile", "torch", "torchcrepe"
+        "numpy", "scipy", "librosa", "soundfile", "torch", "torchcrepe", "swift-f0"
     )
     separator_environment = installed_versions(
         "audio-separator",
@@ -587,16 +625,24 @@ def process(
             )
 
     def extract_anchor() -> None:
+        # CREPE keeps its exact historical command line; other models name
+        # themselves and take the anchor row of their confidence tuning.
+        estimator_arguments = (
+            ["--batch-size", str(anchor_batch_size)]
+            if crepe
+            else ["--estimator", tuning.name, "--estimator-role", "anchor"]
+        )
         cache.run(
             "anchor_extraction",
             {
                 "revision": PIPELINE_CACHE_REVISION,
                 "sourceSha256": cache.file_hash(vocals),
+                "pitch": pitch_identity,
                 "arguments": {
-                    "model": "full",
+                    "model": tuning.anchor_variant,
                     "fmax": 1500,
-                    "batchSize": anchor_batch_size,
-                    "pitchFilter": PRODUCTION_CONFIG.pitch_filter,
+                    "batchSize": anchor_batch_size if crepe else None,
+                    "pitchFilter": contour_config.pitch_filter,
                     "dataOnly": True,
                 },
                 "environment": pitch_environment,
@@ -605,6 +651,7 @@ def process(
                     "voicing.py",
                     "work/contour_filters.py",
                     "work/contour_pipeline_config.py",
+                    "work/pitch_models.py",
                 ),
             },
             [anchor_csv],
@@ -618,10 +665,9 @@ def process(
                     song,
                     "--fmax",
                     "1500",
-                    "--batch-size",
-                    str(anchor_batch_size),
+                    *estimator_arguments,
                     "--pitch-filter",
-                    PRODUCTION_CONFIG.pitch_filter,
+                    contour_config.pitch_filter,
                     "--data-only",
                 ]
             ),
@@ -647,14 +693,15 @@ def process(
             {
                 "revision": PIPELINE_CACHE_REVISION,
                 "sourceSha256": cache.file_hash(pitch_vocals),
+                "pitch": pitch_identity,
                 "arguments": {
-                    "model": "tiny",
+                    "model": tuning.lead_variant,
                     "fmax": 1500,
                     "batchSize": lead_batch_size,
                     "torchThreads": 2,
                     "chunkSeconds": 20,
                     "decoder": "weighted_argmax",
-                    "pitchFilter": PRODUCTION_CONFIG.lead_pitch_filter,
+                    "pitchFilter": contour_config.lead_pitch_filter,
                     "secondaryF0": "pyin",
                     "pyinChunkSeconds": 20,
                     "dataOnly": True,
@@ -666,6 +713,7 @@ def process(
                     "work/build_final_transcriptions.py",
                     "work/contour_filters.py",
                     "work/contour_pipeline_config.py",
+                    "work/pitch_models.py",
                 ),
             },
             [pitch_contour],
@@ -680,6 +728,8 @@ def process(
                     str(lead_batch_size),
                     "--pyin-workers",
                     str(pyin_workers),
+                    "--pitch-model",
+                    tuning.name,
                     "--extract-only",
                 ]
             ),
@@ -777,7 +827,7 @@ def process(
     public_contour = public_data / f"{song}-contour.json"
     public_pyin = public_data / f"{song}-pyin.json"
     contour_outputs = [public_contour, public_pyin]
-    reviewed_model_path = ROOT / PRODUCTION_CONFIG.reviewed_model_path
+    reviewed_model_path = ROOT / contour_config.reviewed_model_path
     cache.run(
         "contour_export",
         {
@@ -785,10 +835,12 @@ def process(
             "leadContourSha256": cache.file_hash(pitch_contour),
             "anchorSha256": cache.file_hash(anchor_csv),
             "notesSha256": cache.file_hash(notes_evidence),
-            "pipelineConfig": PRODUCTION_CONFIG.to_dict(),
+            "pitchModel": tuning.name,
+            "pipelinePreset": tuning.contour_preset,
+            "pipelineConfig": contour_config.to_dict(),
             "reviewedModelSha256": (
                 cache.file_hash(reviewed_model_path)
-                if PRODUCTION_CONFIG.reviewed_model_enabled
+                if contour_config.reviewed_model_enabled
                 and reviewed_model_path.exists()
                 else None
             ),
@@ -801,7 +853,19 @@ def process(
             ),
         },
         contour_outputs,
-        lambda: run([PYTHON, "work/export_contour.py", ".", str(public_data), song]),
+        lambda: run(
+            [
+                PYTHON,
+                "work/export_contour.py",
+                ".",
+                str(public_data),
+                song,
+                "--preset",
+                tuning.contour_preset,
+                "--pitch-model",
+                tuning.name,
+            ]
+        ),
         force=force,
     )
     if not public_contour.exists():
@@ -859,6 +923,12 @@ def main() -> None:
         "--output-dir",
         type=Path,
         help="local library root for audio/ and data/ (default: .sona-data/library)",
+    )
+    parser.add_argument(
+        "--pitch-model",
+        choices=sorted(PITCH_MODELS),
+        default=DEFAULT_PITCH_MODEL,
+        help="pitch model for this song; each has its own tuning in work/pitch_models.py",
     )
     parser.add_argument(
         "--clean-intermediates",
@@ -925,6 +995,7 @@ def main() -> None:
             args.song,
             mp3,
             force=args.force,
+            pitch_model=args.pitch_model,
             clean_intermediates=args.clean_intermediates,
             branch_workers=args.branch_workers,
             kim_batch_size=args.kim_batch_size,

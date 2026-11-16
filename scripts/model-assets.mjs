@@ -42,9 +42,13 @@ export function readModelManifest(path = MODEL_MANIFEST_PATH) {
   ) {
     throw new Error("Unsupported separator model manifest.");
   }
-  for (const [profile, entry] of Object.entries(profiles)) {
-    if (!/^[a-z0-9-]+$/.test(profile) || !Array.isArray(entry?.assets) || !entry.assets.length) {
-      throw new Error(`Invalid separator model profile: ${profile}`);
+  const pitchModels = manifest.pitchModels ?? {};
+  if (typeof pitchModels !== "object") {
+    throw new Error("Unsupported separator model manifest.");
+  }
+  for (const [group, entry] of [...Object.entries(profiles), ...Object.entries(pitchModels)]) {
+    if (!/^[a-z0-9-]+$/.test(group) || !Array.isArray(entry?.assets) || !entry.assets.length) {
+      throw new Error(`Invalid model group in manifest: ${group}`);
     }
     for (const asset of entry.assets) {
       if (
@@ -74,6 +78,14 @@ export function profileAssets(manifest, profile) {
     );
   }
   return entry.assets;
+}
+
+/**
+ * Files a selectable pitch model needs beyond its Python package. Models
+ * that ship inside a package (or with the pipeline itself) need none.
+ */
+export function pitchModelAssets(manifest, name) {
+  return manifest.pitchModels?.[name]?.assets ?? [];
 }
 
 /**
@@ -183,6 +195,17 @@ export async function ensureModelAssets(profile, directory = MODEL_DIRECTORY) {
   }
 }
 
+/**
+ * Download a pitch model's weights the first time a song asks for it.
+ * Resolves immediately for models with nothing to download.
+ */
+export async function ensurePitchModelAssets(name, directory = MODEL_DIRECTORY) {
+  for (const asset of pitchModelAssets(readModelManifest(), name)) {
+    if (await verifyModelAsset(asset, directory)) continue;
+    await downloadModelAsset(asset, directory);
+  }
+}
+
 const invokedPath = process.argv[1]
   ? pathToFileURL(resolve(process.argv[1])).href
   : "";
@@ -192,7 +215,15 @@ if (invokedPath === import.meta.url) {
       process.platform === "win32"
         ? join(ROOT, ".venv", "Scripts", "python.exe")
         : join(ROOT, ".venv", "bin", "python");
-    await ensureModelAssets(process.argv[2] || selectedSeparatorProfile(python));
+    // `model-assets.mjs pitch <name>` fetches one pitch model's weights;
+    // otherwise the argument (or this machine's default) names a separator
+    // profile.
+    if (process.argv[2] === "pitch") {
+      if (!process.argv[3]) throw new Error("Name a pitch model, for example: pitch rmvpe");
+      await ensurePitchModelAssets(process.argv[3]);
+    } else {
+      await ensureModelAssets(process.argv[2] || selectedSeparatorProfile(python));
+    }
   } catch (error) {
     console.error(
       `[model-assets] ${error instanceof Error ? error.message : error}`,

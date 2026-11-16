@@ -53,5 +53,18 @@
         }
       ]
     }
+  },
+  "pitchModels": {
+    "rmvpe": {
+      "sourceRepository": "https://huggingface.co/lj1995/VoiceConversionWebUI",
+      "assets": [
+        {
+          "filename": "rmvpe.onnx",
+          "size": 361688443,
+          "sha256": "5370e71ac80af8b4b7c793d27efd51fd8bf962de3a7ede0766dac0befa3660fd",
+          "url": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.onnx"
+        }
+      ]
+    }
   }
 }
